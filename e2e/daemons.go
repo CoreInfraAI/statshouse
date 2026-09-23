@@ -95,7 +95,7 @@ type daemonStackOpts struct {
 	chIP         string // ClickHouse IPv4 on the run network; "" under the duck backend (no ClickHouse exists)
 	binDir       string // host dir holding the four compiled daemon binaries
 	runID        string
-	cfg          publishConfig
+	apiPublish   string         // host address the api is published on ("127.0.0.1:10888"); "" publishes nothing
 	rpcKeyPath   string         // host path to the shared RPC crypto key (mounted into all four)
 	apiStaticDir string         // host dir with index.html (mounted into the api at staticMount)
 	staticMount  string         // in-container mount target = --static-dir value (apiStaticMount or apiUIMount)
@@ -234,7 +234,7 @@ func startDaemonStack(ctx context.Context, rt Runtime, rec *recorder, o daemonSt
 
 	// --- api (+ published port from config) ---
 	apiC := o.cname("api")
-	apiPortSpec, apiPublished := o.cfg.publishSpec("api", apiPort) // default 127.0.0.1:10888:10888
+	apiPortSpec, apiPublished := fmt.Sprintf("%s:%d", o.apiPublish, apiPort), o.apiPublish != "" // default 127.0.0.1:10888:10888
 	apiStatic := filepath.Join(o.apiStaticDir, "index.html")
 	if !fileExists(apiStatic) {
 		return ds, fmt.Errorf("missing api static asset %q (the api needs index.html to parse at startup)", apiStatic)

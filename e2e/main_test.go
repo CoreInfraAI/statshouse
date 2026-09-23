@@ -2,6 +2,7 @@ package main
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -120,5 +121,21 @@ func TestClientFlag(t *testing.T) {
 	}
 	if got, want := ([]string)(c), []string{"go", "rust"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("values = %v, want %v", got, want)
+	}
+}
+
+func TestResolveAPIAddr(t *testing.T) {
+	for flagVal, want := range map[string]string{"": "127.0.0.1:10888", "10889": "127.0.0.1:10889"} {
+		if got, err := resolveAPIAddr(flagVal); err != nil || got != want {
+			t.Errorf("--api-port=%q: got %q, %v; want %q", flagVal, got, err, want)
+		}
+	}
+	for _, bad := range []string{"abc", "0", "70000"} {
+		if _, err := resolveAPIAddr(bad); err == nil {
+			t.Errorf("--api-port=%q: want an error", bad)
+		}
+	}
+	if got, err := resolveAPIAddr("auto"); err != nil || !strings.HasPrefix(got, "127.0.0.1:") {
+		t.Errorf("--api-port=auto: got %q, %v", got, err)
 	}
 }

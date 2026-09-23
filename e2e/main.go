@@ -24,7 +24,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,7 +53,7 @@ func main() {
 		timeout         = flag.Duration("timeout", 10*time.Minute, "overall run timeout")
 		skipClientBuild = flag.Bool("skip-client-build", false, "reuse previously-built client driver binaries + cached stream (skip the in-container compile); fails if no cached build exists for a selected client")
 		withUI          = flag.Bool("with-ui", false, "build the npm UI in a pinned node container and serve it from the api's --static-dir (default off: no node, no UI build). On apple/container this needs npm on the host to warm the build cache (apple/container has no in-container network); the docker runtime installs online in the node container")
-		apiPortFlag     = flag.String("api-port", "", `override the api published host port: "" uses e2e/config.yaml (default 10888); "auto" picks a free port on 127.0.0.1; or a port number, e.g. "10889", so concurrent runs don't collide`)
+		apiPortFlag     = flag.String("api-port", "", `the api's published host port on 127.0.0.1: "" is 10888; "auto" picks a free port; or a port number, e.g. "10889", so concurrent runs don't collide`)
 		prewarmRetries  = flag.Int("prewarm-retries", 2, "extra attempts when a client's pre-warm times out (driver exit 3, a transient journal-longpoll stall); 0 fails immediately (pre-change behavior)")
 		conformance     = flag.Bool("conformance", false, "differential conformance run: boot ClickHouse plus TWO daemon stacks (ch-backed and duck-backed) over one shared metadata, seed the identical deterministic stream to both agents from the harness itself, and compare both apis' decoded answers to every query shape (CH is the reference; divergence fails the run)")
 		clientSel       clientFlag
@@ -307,8 +306,8 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 	// and stay nil/empty on an early abort, which is exactly the case where the
 	// closure must NOT try to print a reachable api address.
 	var (
-		cfg publishConfig // loaded after the published-port preflight
-		ds  *daemonStack  // started after the daemons build
+		apiAddr string       // the api's published host address, resolved before the published-port preflight
+		ds      *daemonStack // started after the daemons build
 	)
 
 	// --- teardown unless --keep ---
@@ -322,10 +321,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 			// port by default; when it is not published the container IP is reachable
 			// only from inside the run network. cfg/ds are nil on an early abort.
 			rec.logf("keeping resources (--keep): %d container(s) %v on network %s", len(containers), containers, network)
-			addr := ""
-			if cfg != nil {
-				addr = cfg.hostAddr("api")
-			}
+			addr := apiAddr
 			if addr == "" && ds != nil && ds.api != nil {
 				addr = net.JoinHostPort(ds.api.ip, strconv.Itoa(apiPort)) + "  (container IP — reachable from the run network)"
 			}
@@ -385,20 +381,12 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 	// publish port mean one run's assertions silently query the other's api.
 	// Bail before the expensive ClickHouse/daemon setup if a configured host
 	// port already answers.
-	cfg, err = loadConfig(filepath.Join(root, "e2e", "config.yaml"))
-	if err != nil {
-		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("load e2e/config.yaml: %w", err))
-	}
-	// Apply --api-port BEFORE the published-port preflight so an explicit free
-	// port (or "auto") is what gets checked, and so publishSpec/hostAddr — which
-	// both read cfg["api"] — carry the resolved host port through to the -p flag
-	// and the harness's own query address.
-	cfg, err = resolveAPIPort(cfg, apiPortFlag)
+	apiAddr, err = resolveAPIAddr(apiPortFlag)
 	if err != nil {
 		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("--api-port: %w", err))
 	}
-	rec.logf("api published at %s", cfg.hostAddr("api"))
-	if err := checkPublishedPortsFree(ctx, cfg); err != nil {
+	rec.logf("api published at %s", apiAddr)
+	if err := checkPublishedPortFree(ctx, apiAddr); err != nil {
 		return fail(rec, artifactsDir, rt, containers, err)
 	}
 
@@ -501,7 +489,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 		chIP:         chIP,
 		binDir:       binDir,
 		runID:        runID,
-		cfg:          cfg,
+		apiPublish:   apiAddr,
 		rpcKeyPath:   rpcKeyPath,
 		apiStaticDir: apiStaticDir,
 		staticMount:  apiMountTarget,
@@ -515,10 +503,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 	rec.logf("daemon stack ready (metadata+agg+api+agent green in %.1fs)", time.Since(start).Seconds())
 
 	// --- /api/query answers on the published port ---
-	queryAddr := cfg.hostAddr("api") // "127.0.0.1:10888"; falls back to the container IP if not published
-	if queryAddr == "" {
-		queryAddr = net.JoinHostPort(ds.api.ip, strconv.Itoa(apiPort))
-	}
+	queryAddr := apiAddr
 	body, err := queryAPI(ctx, queryAddr)
 	if err != nil {
 		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("api query: %w", err))
@@ -564,7 +549,6 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 			network:      network,
 			binDir:       duckBinDir,
 			runID:        runID,
-			cfg:          publishConfig{}, // no published port: the harness dials the container IP directly
 			rpcKeyPath:   rpcKeyPath,
 			apiStaticDir: apiStaticDir,
 			staticMount:  apiMountTarget,
@@ -974,72 +958,39 @@ func listSafe(ctx context.Context, fn func(context.Context) ([]string, error)) [
 	return v
 }
 
-// resolveAPIPort applies the --api-port flag to the publish config's "api"
-// entry — the single source every downstream reader (publishSpec for the -p
-// flag, hostAddr for the harness's own query address) already consults:
-//   - "" leaves config.yaml's publish.api untouched (default behavior).
-//   - "auto" grabs a free port on the loopback via a brief net.Listen(":0").
-//   - any other value must parse as a port number 1-65535 and overrides the host
-//     port, keeping the configured host IP (defaulting to 127.0.0.1 when api is
-//     unpublished).
-//
-// The result is validated as host:port (matching loadConfig's validatePublish)
-// so checkPublishedPortsFree and publishSpec never see a malformed value.
-func resolveAPIPort(cfg publishConfig, flagVal string) (publishConfig, error) {
-	if flagVal == "" {
-		return cfg, nil
-	}
-	host := "127.0.0.1"
-	if existing := cfg.hostAddr("api"); existing != "" {
-		if h, _, perr := net.SplitHostPort(existing); perr == nil && h != "" {
-			host = h
-		}
-	}
-	var port int
-	switch {
-	case flagVal == "auto":
-		ln, lerr := net.Listen("tcp", net.JoinHostPort(host, "0"))
-		if lerr != nil {
-			return nil, fmt.Errorf("pick free api port on %s: %w", host, lerr)
+// resolveAPIAddr turns --api-port into the api's published host address:
+// "" is the default 127.0.0.1:10888, "auto" a free loopback port.
+func resolveAPIAddr(flagVal string) (string, error) {
+	port := apiPort
+	switch flagVal {
+	case "":
+	case "auto":
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return "", fmt.Errorf("pick a free api port: %w", err)
 		}
 		port = ln.Addr().(*net.TCPAddr).Port
 		_ = ln.Close()
 	default:
-		n, perr := strconv.Atoi(flagVal)
-		if perr != nil || n < 1 || n > 65535 {
-			return nil, fmt.Errorf("%q must be \"auto\" or a port number 1-65535", flagVal)
+		n, err := strconv.Atoi(flagVal)
+		if err != nil || n < 1 || n > 65535 {
+			return "", fmt.Errorf("%q must be \"auto\" or a port number 1-65535", flagVal)
 		}
 		port = n
 	}
-	cfg["api"] = net.JoinHostPort(host, strconv.Itoa(port))
-	if err := validatePublish("api", cfg["api"]); err != nil {
-		return nil, err
-	}
-	return cfg, nil
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), nil
 }
 
-// checkPublishedPortsFree dials every host address the config publishes; if any
-// already accepts a connection, another process owns that port (a parallel e2e
-// run, a --keep stack, or a stray binding). Two concurrent harness runs collide
-// hard: they prune each other's containers AND share the fixed api publish port,
-// so one run's assertions silently query the other's api. Failing here — before
-// the stack publishes anything — is far cheaper than debugging the cross-talk.
-// The dial is short: nothing answering returns "refused" instantly; any other
-// error is treated as "free" so a flaky loopback never blocks a clean run.
-func checkPublishedPortsFree(ctx context.Context, cfg publishConfig) error {
-	var clash []string
-	for _, host := range cfg {
-		d := net.Dialer{Timeout: 500 * time.Millisecond}
-		c, err := d.DialContext(ctx, "tcp", host)
-		if err == nil {
-			c.Close()
-			clash = append(clash, host)
-		}
-	}
-	if len(clash) > 0 {
-		sort.Strings(clash)
-		return fmt.Errorf("published port(s) already in use: %s — another e2e run? a --keep stack? stop it, or change e2e/config.yaml publish ports",
-			strings.Join(clash, ", "))
+// checkPublishedPortFree fails when something already answers on the api's
+// host address: two concurrent harness runs collide hard — they prune each
+// other's containers and one run's assertions silently query the other's api —
+// and failing here, before the stack publishes anything, is far cheaper than
+// debugging the cross-talk. A dial error other than success counts as free.
+func checkPublishedPortFree(ctx context.Context, addr string) error {
+	d := net.Dialer{Timeout: 500 * time.Millisecond}
+	if c, err := d.DialContext(ctx, "tcp", addr); err == nil {
+		c.Close()
+		return fmt.Errorf("published port %s already in use — another e2e run? a --keep stack? stop it, or pass --api-port", addr)
 	}
 	return nil
 }
