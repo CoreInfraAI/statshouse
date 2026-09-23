@@ -581,3 +581,18 @@ func TestStatshouseGoSingleAddrCloseQuirk(t *testing.T) {
 
 	require.Equal(t, statshouseGoEmptyAddrErr, cl.Close().Error())
 }
+
+// Series of two metrics sharing a tag signature compare by value, whatever
+// order each API listed them in.
+func TestCompareConfSeriesSharedSignature(t *testing.T) {
+	series := func(first, second float64) *confSeriesResp {
+		var r confSeriesResp
+		r.Data.Series.Time = []int64{1}
+		x := map[string]apiMetaTag{"key0": {Value: "x"}}
+		r.Data.Series.SeriesMeta = []confSeriesMeta{{Tags: x}, {Tags: x}}
+		r.Data.Series.SeriesData = [][]float64{{first}, {second}}
+		return &r
+	}
+	require.Empty(t, compareConfSeries(series(2, 5), series(5, 2), "count"))
+	require.NotEmpty(t, compareConfSeries(series(2, 5), series(5, 3), "count"))
+}

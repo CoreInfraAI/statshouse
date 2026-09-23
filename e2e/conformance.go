@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -435,15 +436,31 @@ type confSeriesRow struct {
 	hosts []string
 }
 
+// indexConfSeries keys series by tagSignature. Series of different metrics can
+// share one (a multi-metric PromQL selector without the name label), and the
+// API orders them by a per-process metric order, so such a group is ranked by
+// its values and keyed signature#rank.
 func indexConfSeries(r *confSeriesResp) map[string]confSeriesRow {
-	out := make(map[string]confSeriesRow, len(r.Data.Series.SeriesMeta))
+	groups := map[string][]confSeriesRow{}
 	for i, meta := range r.Data.Series.SeriesMeta {
 		var row confSeriesRow
 		if i < len(r.Data.Series.SeriesData) {
 			row.data = r.Data.Series.SeriesData[i]
 		}
 		row.hosts = meta.MaxHosts
-		out[tagSignature(meta.Tags)] = row
+		sig := tagSignature(meta.Tags)
+		groups[sig] = append(groups[sig], row)
+	}
+	out := make(map[string]confSeriesRow, len(r.Data.Series.SeriesMeta))
+	for sig, rows := range groups {
+		if len(rows) == 1 {
+			out[sig] = rows[0]
+			continue
+		}
+		sort.Slice(rows, func(a, b int) bool { return slices.Compare(rows[a].data, rows[b].data) < 0 })
+		for i, row := range rows {
+			out[fmt.Sprintf("%s#%d", sig, i)] = row
+		}
 	}
 	return out
 }
