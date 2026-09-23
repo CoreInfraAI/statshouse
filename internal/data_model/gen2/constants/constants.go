@@ -154,15 +154,8 @@ const (
 	StatshouseSendSourceBucket3Response          = 0x0e177acc // statshouse.sendSourceBucket3Response
 	StatshouseShutdownInfo                       = 0x4124cf9c // statshouse.shutdownInfo
 	StatshouseSourceBucket3                      = 0x16c4dd7b // statshouse.sourceBucket3
-	StatshouseStoreLod                           = 0x57cb1003 // statshouse.storeLod
-	StatshouseStoreQueryBase                     = 0x57cb1004 // statshouse.storeQueryBase
-	StatshouseStoreQuerySeries                   = 0x57cb1008 // statshouse.storeQuerySeries
-	StatshouseStoreQueryTagValues                = 0x57cb1009 // statshouse.storeQueryTagValues
-	StatshouseStoreSeriesBatch                   = 0x57cb1005 // statshouse.storeSeriesBatch
-	StatshouseStoreSeriesResponse                = 0x57cb1006 // statshouse.storeSeriesResponse
-	StatshouseStoreTagFilter                     = 0x57cb1001 // statshouse.storeTagFilter
-	StatshouseStoreTagLayout                     = 0x57cb1002 // statshouse.storeTagLayout
-	StatshouseStoreTagValuesResponse             = 0x57cb1007 // statshouse.storeTagValuesResponse
+	StatshouseStoreQuery                         = 0x57cb1011 // statshouse.storeQuery
+	StatshouseStoreQueryResponse                 = 0x57cb1010 // statshouse.storeQueryResponse
 	StatshouseTestConnection2                    = 0x4285ff58 // statshouse.testConnection2
 	StatshouseTopElement                         = 0x9ffdea42 // statshouse.topElement
 	StatshouseApiChunkResponse                   = 0x63928b42 // statshouseApi.chunkResponse

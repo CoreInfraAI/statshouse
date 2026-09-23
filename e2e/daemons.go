@@ -28,16 +28,9 @@ const (
 	apiRPCPort = 10889 // api RPC
 	agentPort  = 13337 // agent client: raw UDP + RPC TCP
 
-	// aggQueryPort is the aggregator's SECOND listener under the duck backend:
-	// the store-query RPC the api fans out to (duck-store's bounded,
-	// admission-controlled query endpoint). Unused under clickhouse.
-	aggQueryPort = 13338
-
 	// duckStoreMount is the in-container directory the aggregator's duck-store
-	// owns under the duck backend (delta generations + archive windows are
-	// created inside on first start). The container's writable layer is enough —
-	// the store lives and dies with the run, exactly like the ClickHouse data
-	// dir of a clickhouse run.
+	// owns under the duck backend. The container's writable layer is enough —
+	// the store lives and dies with the run, like ClickHouse's data dir.
 	duckStoreMount = "/store"
 
 	// rpcKeyMount is where the shared RPC crypto key is mounted inside every
@@ -233,10 +226,10 @@ func startDaemonStack(ctx context.Context, rt Runtime, rec *recorder, o daemonSt
 	// store-query RPC answers a real query (the replacement for "ClickHouse
 	// schema finished loading" as the storage-readiness gate).
 	if o.backend == backendDuck {
-		if err := waitStoreQueryReady(ctx, rt, aggC, storeQueryAddr(ds.agg.ip), o.rpcKeyPath); err != nil {
+		if err := waitStoreQueryReady(ctx, rt, aggC, net.JoinHostPort(ds.agg.ip, strconv.Itoa(aggPort)), o.rpcKeyPath); err != nil {
 			return ds, err
 		}
-		rec.logf("agg store-query rpc ready (real storeQuerySeries round-trip on :%d)", aggQueryPort)
+		rec.logf("agg store-query rpc ready (real storeQuery round-trip on :%d)", aggPort)
 	}
 
 	// --- api (+ published port from config) ---
@@ -355,8 +348,7 @@ func startDaemonStack(ctx context.Context, rt Runtime, rec *recorder, o daemonSt
 //   - clickhouse: `--kh=<ch-ip>:8123` names the ClickHouse to write to.
 //   - duck: no ClickHouse exists. `--storage-backend=duck` selects the embedded
 //     DuckDB store (the binary mounted at /statshouse-agg is the duckdb-tagged
-//     build), `--duck-store-dir` owns the store, `--duck-query-addr` opens the
-//     second, query-only listener, and `--local-shard/--local-replica` name the
+//     build), `--duck-store-dir` owns the store, and `--local-shard` names the
 //     shard this single process is (the CH cluster autodetect the clickhouse
 //     stack relies on has nothing to read under duck).
 //
@@ -373,9 +365,7 @@ func aggRunScript(o daemonStackOpts, metaIP string) string {
 		storageFlags = fmt.Sprintf(` \
   --storage-backend=duck \
   --duck-store-dir=%[1]s \
-  --duck-query-addr=0.0.0.0:%[2]d \
-  --local-shard=1 \
-  --local-replica=1`, duckStoreMount, aggQueryPort)
+  --local-shard=1`, duckStoreMount)
 	default:
 		storageFlags = fmt.Sprintf(` \
   --kh=%[1]s:8123`, o.chIP)
@@ -405,10 +395,8 @@ exec /statshouse-agg \
 // binary; joinSh turns it into the exec argv). metaIP and aggIP are the
 // metadata/aggregator container IPs. The storage flags branch on the backend:
 // under clickhouse the api reads ClickHouse directly (`--clickhouse-v2-addrs`),
-// under duck it fans every query out to the aggregator's store-query listener
-// (`--storage-backend=duck` + `--duck-shard-query-addrs` + the matching
-// `--shard-by-metric-shards=1`, the same single shard the aggregator owns,
-// numbered 1).
+// under duck it sends every query to the aggregator's RPC port
+// (`--storage-backend=duck` + `--duck-shard-addrs`).
 func apiDaemonFlags(o daemonStackOpts, metaIP, aggIP string) []string {
 	flags := []string{
 		"--local-mode",
@@ -428,11 +416,7 @@ func apiDaemonFlags(o daemonStackOpts, metaIP, aggIP string) []string {
 	if o.backend == backendDuck {
 		flags = append(flags,
 			"--storage-backend=duck",
-			"--duck-shard-query-addrs=1="+storeQueryAddr(aggIP),
-			// the single-shard cluster routes by metric_id % 1; the API's
-			// copy of the count must match or startup refuses the mismatch
-			// between the default 16 and the one configured address
-			"--shard-by-metric-shards=1")
+			"--duck-shard-addrs="+net.JoinHostPort(aggIP, strconv.Itoa(aggPort)))
 	} else {
 		chV2 := strings.TrimSuffix(strings.Repeat(o.chIP+":9000,", 3), ",") // <ch-ip>:9000 three times (cluster config shape)
 		flags = append(flags, "--clickhouse-v2-addrs="+chV2)

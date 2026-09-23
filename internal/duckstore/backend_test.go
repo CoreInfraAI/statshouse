@@ -96,5 +96,4 @@ func TestDefaultRetentionMirrorsClickHouseTTLs(t *testing.T) {
 	require.Equal(t, 52*time.Hour, DefaultRetention1s)
 	require.Equal(t, 33*24*time.Hour, DefaultRetention1m)
 	require.Equal(t, time.Duration(0), DefaultRetention1h, "the 1h tier is unbounded by default")
-	require.Equal(t, uint64(0), DefaultFreeSpaceWatermark, "the free-space safety net is off by default")
 }

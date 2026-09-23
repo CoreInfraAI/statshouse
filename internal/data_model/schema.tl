@@ -168,105 +168,13 @@ statshouse.sendSourceBucket3Response#0e177acc
     metric_budgets: field_mask.1?(vector statshouse.metricBudget)
 = statshouse.SendSourceBucket3Response;
 
-// ---------------------------------------------------------------- store query RPC
-//
-// Structured query protocol between statshouse-api and the aggregator's storage
-// backend (duck-store). Served by the aggregator on a separate listener from
-// ingest. Backend-neutral naming: nothing here is DuckDB-specific, and SQL text
-// never crosses this wire. See .scratch/duck-store/04-query-rpc.tl for the
-// resolved contract.
-
-// One tag predicate. Within a filter the mapped/values/empty/re2 arms are OR-ed
-// for an IN filter and AND-ed for a NOT IN filter (what filterOperatorIn/NotIn do
-// in internal/api/sql_query_series.go). re2 is unanchored RE2; values must bind
-// as prepared statement parameters, never interpolate into SQL text.
-statshouse.storeTagFilter#57cb1001
-    fields_mask:#
-    tag_index:int                          // 0 .. format.MaxTags-1 (48)
-    mapped:fields_mask.0?(vector long)     // long, not int: carries a raw64 value whole
-    values:fields_mask.1?(vector string)   // unmapped string values, matched against stagN
-    empty:fields_mask.2?true               // tagN = 0 AND stagN = ''
-    re2:fields_mask.3?string
-    = statshouse.StoreTagFilter;
-
-// Per-tag storage interpretation as the API resolved it from ITS journal:
-// 0 = mapped  tagN holds a mapping id, stagN may hold an unmapped string
-// 1 = raw32   tagN holds the value directly, stagN unused
-// 2 = raw64   value SPLIT: low half in tagN, high half in tagN+1
-// The aggregator validates against its own journal at metric_version and
-// returns metadata_mismatch on disagreement — it never reinterprets rows.
-statshouse.storeTagLayout#57cb1002
-    kinds:(vector int)
-    = statshouse.StoreTagLayout;
-
-// The queried resolution window. step_sec is one of the 11 LOD steps; the
-// aggregator maps it onto the 1s/1m/1h tier table itself. location is only
-// meaningful for the _1M (calendar month) step; every other step uses utc_offset.
-statshouse.storeLod#57cb1003
-    from_sec:long        // inclusive
-    to_sec:long          // exclusive
-    step_sec:long
-    utc_offset:long
-    location:string      // IANA name, e.g. "Europe/Moscow"
-    = statshouse.StoreLod;
-
-// Shared by both query verbs.
-statshouse.storeQueryBase#57cb1004
-    fields_mask:#
-    metric_id:int
-    metric_version:long                             // journal version tag_layout was read at
-    tag_layout:statshouse.StoreTagLayout
-    metric_in:fields_mask.0?(vector int)            // multi-metric filter (PromQL)
-    metric_not_in:fields_mask.1?(vector int)
-    lod:statshouse.StoreLod
-    filter_in:(vector statshouse.StoreTagFilter)
-    filter_not_in:(vector statshouse.StoreTagFilter)
-    row_limit:int                                   // clamped by the aggregator to its own max
-    timeout_ms:int                                  // RELATIVE, not an absolute deadline: immune to clock skew
-    = statshouse.StoreQueryBase;
-
-// One batch of columnar results; columns are parallel arrays of length `rows`.
-// Forward-compatibility hinge: a later streaming verb returns the SAME type one
-// batch at a time. Aggregate states ride as unmodified ClickHouse state bytes,
-// never finalized — a per-shard percentile is meaningless before the API merges
-// across shards and LODs. The aggregator has already folded them in Go.
-// Host columns are plain (int, string) tag pairs merged by a single
-// arg_min/arg_max over a struct_pack, so they ship structurally and are compared
-// by value, not by bytes.
-statshouse.storeSeriesBatch#57cb1005
-    fields_mask:#
+// Result of statshouse.storeQuery: every column of the result set in
+// ClickHouse Native encoding, so the API decodes duck-store answers with the
+// same column readers it uses for ClickHouse.
+statshouse.storeQueryResponse#57cb1010
     rows:int
-    time:(vector long)                              // start of each bucket, unix seconds
-    tag:(vector %(vector long))                     // one vector per grouped tag, in `by` order
-    stag:(vector %(vector string))                  // parallel to `tag`; empty vector if raw
-    count:fields_mask.0?(vector double)
-    min:fields_mask.1?(vector double)
-    max:fields_mask.2?(vector double)
-    sum:fields_mask.3?(vector double)
-    sumsquare:fields_mask.4?(vector double)
-    cardinality:fields_mask.5?(vector double)
-    percentiles:fields_mask.6?(vector string)       // CH quantilesTDigest state bytes
-    uniq_state:fields_mask.7?(vector string)        // CH uniq state bytes
-    min_host_value:fields_mask.8?(vector double)
-    min_host_tag:fields_mask.8?(vector int)
-    min_host_stag:fields_mask.8?(vector string)
-    max_host_value:fields_mask.9?(vector double)
-    max_host_tag:fields_mask.9?(vector int)
-    max_host_stag:fields_mask.9?(vector string)
-    = statshouse.StoreSeriesBatch;
-
-statshouse.storeSeriesResponse#57cb1006
-    fields_mask:#
-    shard_num:int                       // the aggregator's own shard, supplied as a literal: nothing is stored per-row
-    batches:(vector statshouse.StoreSeriesBatch)
-    = statshouse.StoreSeriesResponse;
-
-statshouse.storeTagValuesResponse#57cb1007
-    fields_mask:#
-    tag:(vector long)
-    stag:(vector string)                // empty when ids_only or the tag is raw
-    count:(vector double)
-    = statshouse.StoreTagValuesResponse;
+    columns:(vector string)
+    = statshouse.StoreQueryResponse;
 
 ---functions---
 
@@ -374,39 +282,9 @@ statshouse.storeTagValuesResponse#57cb1007
     response_timeout_sec:int // if >0, will long poll for requested time
      = String;
 
-// The series verb. Covers every read surface that goes through buildSeriesQuery
-// today — series, point queries, the table view, cardinality, PromQL series and
-// the 1/sec cache-invalidation log query (a tag-only series query: empty `what`,
-// group by tag1). what[] carries data_model.DigestSelector kinds; an empty
-// what[] is legal and means "grouped tags and timestamps only". by[] carries
-// grouped tag indices; format.ShardTagIndex (-3) is legal and is answered from
-// shard_num, not from storage.
-//
-// Row limit semantics: the aggregator executes with LIMIT row_limit+1, because
-// LIMIT N cannot distinguish "exactly N rows" from truncation. If the extra row
-// appears the call FAILS with row_limit — a partial series result is never
-// returned and never cached by the API.
-@read statshouse.storeQuerySeries#57cb1008
+// Runs one SELECT against the aggregator's duck-store. The API renders the
+// SQL with the same builder it uses for ClickHouse.
+@read statshouse.storeQuery#57cb1011
     fields_mask:#
-    base:%statshouse.StoreQueryBase
-    what:(vector int)
-    by:(vector int)
-    min_host:fields_mask.0?true
-    max_host:fields_mask.1?true
-    sort_desc:fields_mask.2?true                    // table view; absent = unsorted
-    sort_asc:fields_mask.3?true
-    = statshouse.StoreSeriesResponse;
-
-// The tag-values verb, covering both the values and the ids-only mode.
-//
-// CRITICAL: the aggregator MUST NOT apply the user's top-N. A value ranked below
-// N on every individual shard can still be globally top-N once counts are
-// summed, so per-shard top-N silently returns wrong answers. The aggregator
-// returns ALL values up to row_limit (a safety cap, not the user's N) and fails
-// on truncation; the API sums counts across shards and takes the global top N.
-@read statshouse.storeQueryTagValues#57cb1009
-    fields_mask:#
-    base:%statshouse.StoreQueryBase
-    tag_index:int
-    ids_only:fields_mask.0?true                     // ids-only mode
-    = statshouse.StoreTagValuesResponse;
+    sql:string
+    = statshouse.StoreQueryResponse;

@@ -4,24 +4,26 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Package duckstore implements the DuckDB storage backend for StatsHouse:
-// DuckDB files embedded in the aggregator and read by the API over the
-// structured query RPC. Everything that touches the DuckDB driver sits
-// behind the "duckdb" build tag, so binaries built without it stay pure Go.
+// Package duckstore implements the DuckDB storage backend for StatsHouse: one
+// DuckDB file embedded in each aggregator shard, written by the aggregator's
+// insert conveyor and read by the API over the statshouse.storeQuery RPC.
+// Everything that touches the DuckDB driver sits behind the "duckdb" build
+// tag, so binaries built without it stay pure Go.
 package duckstore
 
 import (
 	"fmt"
+	"runtime"
 	"time"
+
+	"github.com/VKCOM/statshouse/internal/format"
 )
 
 // BuildTag is the Go build tag that compiles DuckDB support into a binary.
 const BuildTag = "duckdb"
 
 // Default retention per tier, mirroring ClickHouse's TTLs so switching
-// backends does not change how long data lives: an archive window file is
-// unlinked once the window it covers ended this long ago. Zero keeps the
-// tier's windows forever.
+// backends does not change how long data lives. Zero keeps the tier forever.
 const (
 	DefaultRetention1s = 52 * time.Hour
 	DefaultRetention1m = 33 * 24 * time.Hour
@@ -29,65 +31,14 @@ const (
 	DefaultRetention1h time.Duration = 0
 )
 
-// DefaultFreeSpaceWatermark is the free-space low watermark's default: the
-// safety net is off until an operator sets it, because disk is bounded
-// upstream by the sampling budget and there is no required disk-cap flag.
-const DefaultFreeSpaceWatermark uint64 = 0
+// DefaultMemoryLimitBytes is DuckDB's memory_limit; the spill-to-disk bound
+// follows it. Defaults target the smallest viable node, not the available
+// envelope: an embedded DuckDB must not grow into the RAM the aggregator's own
+// conveyor needs.
+const DefaultMemoryLimitBytes int64 = 256 << 20
 
-// Resource bounds for every DuckDB database instance the store opens, so an
-// embedded DuckDB cannot grow into the CPU and RAM the aggregator's own
-// conveyor needs. Defaults target the smallest viable node, not the available
-// envelope: one execution thread, a 256 MB memory limit and a temp directory
-// bounded to the same 256 MB. The memory limit bounds intermediate state only
-// (a measured 100 MB limit still produced a 382 MB result — nothing but the
-// row cap bounds result size), which is why it sits alongside the row limit
-// and the query admission control rather than instead of them.
-const (
-	// DefaultDuckDBThreads is DuckDB's thread count per store file: the spec
-	// fixes one, so compaction, sealing and queries all run single-threaded
-	// and never compete for CPU with ingestion.
-	DefaultDuckDBThreads = 1
-	// DefaultMemoryLimitBytes is DuckDB's memory_limit per store file.
-	DefaultMemoryLimitBytes int64 = 256 << 20
-	// DefaultMaxTempDirBytes is DuckDB's max_temp_directory_size per store
-	// file when nothing is set at all: the bound that makes "spill to disk
-	// instead of OOM" terminate with an out-of-memory error instead of
-	// filling the volume. An unset bound tracks the memory limit rather than
-	// DuckDB's own 90%-of-disk — including an operator-set memory limit, so
-	// raising --duck-memory-limit does not silently leave the spill bound
-	// pinned to this default.
-	DefaultMaxTempDirBytes int64 = 256 << 20
-)
-
-// ResourcesConfig carries the DuckDB resource bounds applied when a store file
-// is opened. The zero value means the defaults above.
-type ResourcesConfig struct {
-	// Threads is DuckDB's threads setting per opened store file.
-	Threads int
-	// MemoryLimitBytes is DuckDB's memory_limit per opened store file.
-	MemoryLimitBytes int64
-	// MaxTempDirBytes is DuckDB's max_temp_directory_size per opened store
-	// file. Each file spills into its own temp directory next to itself.
-	// Unset (0) tracks MemoryLimitBytes, whatever it resolved to.
-	MaxTempDirBytes int64
-}
-
-// WithDefaults returns res with unset fields filled from the defaults, so a
-// zero ResourcesConfig behaves like the defaults and a partially set one
-// keeps its explicit values — except MaxTempDirBytes, whose unset value tracks
-// the memory limit rather than a fixed default.
-func (res ResourcesConfig) WithDefaults() ResourcesConfig {
-	if res.Threads <= 0 {
-		res.Threads = DefaultDuckDBThreads
-	}
-	if res.MemoryLimitBytes <= 0 {
-		res.MemoryLimitBytes = DefaultMemoryLimitBytes
-	}
-	if res.MaxTempDirBytes <= 0 {
-		res.MaxTempDirBytes = res.MemoryLimitBytes
-	}
-	return res
-}
+// DefaultQueryConcurrency is how many store queries execute at once.
+var DefaultQueryConcurrency = max(2, runtime.GOMAXPROCS(0))
 
 // StorageBackend selects which storage backend metric data is written to and
 // read from. Parsed from --storage-backend by the aggregator and the API.
@@ -95,10 +46,10 @@ type StorageBackend int8
 
 const (
 	// BackendClickHouse is the default: all writes and reads go to the
-	// ClickHouse cluster, behaviourally identical to the pre-seam code.
+	// ClickHouse cluster.
 	BackendClickHouse StorageBackend = iota
-	// BackendDuck stores metric data in the local duck-store files owned by
-	// each aggregator shard.
+	// BackendDuck stores metric data in the duck-store owned by each
+	// aggregator shard.
 	BackendDuck
 )
 
@@ -117,12 +68,10 @@ func ParseStorageBackend(s string) (StorageBackend, error) {
 
 // String implements flag.Value.
 func (b StorageBackend) String() string {
-	switch b {
-	case BackendDuck:
+	if b == BackendDuck {
 		return "duck"
-	default:
-		return "clickhouse"
 	}
+	return "clickhouse"
 }
 
 // Set implements flag.Value.
@@ -135,14 +84,31 @@ func (b *StorageBackend) Set(s string) error {
 	return nil
 }
 
-// Validate reports whether this binary can actually run backend b. A binary
-// built without the "duckdb" build tag has no DuckDB compiled in and must
-// refuse --storage-backend=duck at startup instead of failing later with an
-// obscure error. Backends that do not embed DuckDB (the API talks to the
-// aggregators over RPC) must not gate on this.
+// Validate reports whether this binary can run backend b as the storage
+// owner: a binary built without the "duckdb" build tag must refuse
+// --storage-backend=duck at startup. The API, which only talks to the
+// aggregators over RPC, must not gate on this.
 func (b StorageBackend) Validate() error {
 	if b == BackendDuck && !Available {
 		return fmt.Errorf("--storage-backend=duck is not supported by this binary: it was built without the %q build tag that embeds DuckDB", BuildTag)
 	}
 	return nil
+}
+
+// Config configures a Store.
+type Config struct {
+	Dir      string
+	ShardNum int // 1-based, what queries see as _shard_num
+	// Per-tier retention; zero keeps the tier forever.
+	Retention1s, Retention1m, Retention1h time.Duration
+	MemoryLimitBytes                      int64 // DuckDB memory_limit; 0 means DefaultMemoryLimitBytes
+	QueryConcurrency                      int   // queries executing at once; 0 means DefaultQueryConcurrency
+	Metrics                               MetricsRecorder
+	Logf                                  func(format string, args ...any)
+}
+
+// MetricsRecorder receives the store's builtin __duck_store_* metrics; the
+// aggregator's built-in agent implements it.
+type MetricsRecorder interface {
+	AddValueCounter(t uint32, metricInfo *format.MetricMetaValue, tags []int32, value float64, counter float64)
 }

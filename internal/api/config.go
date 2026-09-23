@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"maps"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -43,41 +42,15 @@ type Config struct {
 	HardwareSlowMetricResolution int
 	Announcement                 string // if !empty, show to user in UI
 	RQLiteAddrs                  string // comma-separated list
-
-	// StorageBackend selects where the API reads metric data from. The API
-	// never embeds DuckDB itself (it queries the aggregator shards over the
-	// structured query RPC), so duck is a valid choice for any API binary
-	// and is deliberately not gated on duckstore.Available.
-	StorageBackend duckstore.StorageBackend
-
-	// DuckShardQueryAddrsStr lists the per-shard store-query addresses of the
-	// aggregator shards, as "shard=host:port" pairs — the shard set the duck
-	// backend fans every query out over. Shard numbers are 1-based and must
-	// match the aggregator cluster's own numbering.
-	DuckShardQueryAddrsStr string
-	// DuckShardQueryAddrs is DuckShardQueryAddrsStr parsed: shard number →
-	// store-query address.
-	DuckShardQueryAddrs map[uint32]string
-
-	// DuckQueryRPCCryptoKey is the RPC crypto key the fan-out clients present
-	// to the aggregator shards' store-query listeners. Not a flag: the key
-	// already arrives via --rpc-crypto-path, and the command reads that file
-	// and copies the key here, so the same key serves every RPC the process
-	// makes. Empty keeps the transport unencrypted (same-machine peers only).
-	DuckQueryRPCCryptoKey string
-
-	// ShardByMetricShards is the number of shards the by-metric-id strategy
-	// routes over — the copy of the aggregator cluster's
-	// --shard-by-metric-shards (see the command's flag help), the modulus
-	// agents shard metric data by at write time. The ClickHouse pool routes
-	// by it, and the duck backend both routes by it and requires
-	// --duck-shard-query-addrs to cover every shard it can route to.
-	ShardByMetricShards int
-
+	StorageBackend               duckstore.StorageBackend
+	DuckShardAddrs               []string // aggregator RPC addresses in shard order, read by the duck backend
 	chutil.RateLimitConfig
 }
 
 func (argv *Config) ValidateConfig() error {
+	if argv.StorageBackend == duckstore.BackendDuck && len(argv.DuckShardAddrs) == 0 {
+		return fmt.Errorf("--duck-shard-addrs must be set when --storage-backend=duck")
+	}
 	if argv.UserLimitsStr != "" {
 		var userLimits []chutil.ConnLimits
 		err := json.Unmarshal([]byte(argv.UserLimitsStr), &userLimits)
@@ -121,58 +94,6 @@ func (argv *Config) ValidateConfig() error {
 			return fmt.Errorf("failed to parse available shards: %w", err)
 		}
 		argv.AvailableShards = shards
-	}
-	argv.DuckShardQueryAddrs = nil
-	if argv.DuckShardQueryAddrsStr != "" {
-		addrs, err := parseDuckShardQueryAddrs(argv.DuckShardQueryAddrsStr)
-		if err != nil {
-			return err
-		}
-		argv.DuckShardQueryAddrs = addrs
-	}
-	if argv.StorageBackend == duckstore.BackendDuck {
-		// Every duck query fans out to the aggregator shards' store-query
-		// listeners; an API without their addresses can serve nothing, so it
-		// must refuse to start rather than return errors per request.
-		if len(argv.DuckShardQueryAddrs) == 0 {
-			return fmt.Errorf("--duck-shard-query-addrs must be set when --storage-backend=duck: every query fans out to the aggregator shards' store-query listeners")
-		}
-		// The by-metric-id assignment shards by --shard-by-metric-shards —
-		// the copy of the aggregator cluster's routing modulus — so the
-		// addresses must cover shards 1..N of that count: a partial list
-		// would silently misroute every by-metric-id query the source prunes
-		// to one shard, and silently drop the shards fan-outs never visit.
-		// The numbering must also be contiguous from 1: a gap can only be a
-		// typo. Addresses beyond the count may exist — a cluster can hold
-		// more shards than the modulus pins by-metric-id data to (the
-		// aggregator allows the count under the cluster size), and
-		// fixed-shard metrics and fan-outs still read them.
-		shards := make([]uint32, 0, len(argv.DuckShardQueryAddrs))
-		for shard := range argv.DuckShardQueryAddrs {
-			shards = append(shards, shard)
-		}
-		slices.Sort(shards)
-		for i, shard := range shards {
-			if shard != uint32(i+1) {
-				return fmt.Errorf("--duck-shard-query-addrs must number the shards 1..%d contiguously: shard %d breaks the numbering",
-					shards[len(shards)-1], shard)
-			}
-		}
-		switch {
-		case argv.ShardByMetricShards < 0:
-			return fmt.Errorf("--shard-by-metric-shards (%d) must not be negative", argv.ShardByMetricShards)
-		case argv.ShardByMetricShards == 0:
-			// 0 keeps the ClickHouse-pool meaning of "derive from what is
-			// configured": for duck, the highest configured shard — which
-			// the contiguous numbering above makes the address count.
-		default:
-			if argv.ShardByMetricShards > len(shards) {
-				return fmt.Errorf("--shard-by-metric-shards is %d but --duck-shard-query-addrs lists only %d shards: by-metric-id data lands on shards 1..%d and every one needs a query address",
-					argv.ShardByMetricShards, len(shards), argv.ShardByMetricShards)
-			}
-		}
-	} else if argv.DuckShardQueryAddrsStr != "" {
-		return fmt.Errorf("--duck-shard-query-addrs (%s) is set but --storage-backend is not duck", argv.DuckShardQueryAddrsStr)
 	}
 	argv.ReplicaThrottleCfg = nil
 	if argv.ReplicaThrottleCfgStr != "" {
@@ -220,11 +141,6 @@ func (argv *Config) Bind(f *flag.FlagSet, defaultI config.Config) {
 	f.StringVar(&argv.ReplicaThrottleCfgStr, "replica-throttle-config", "", "JSON config for replica throttling testing (feature flag)")
 	f.IntVar(&argv.HardwareMetricResolution, "hardware-metric-resolution", default_.HardwareMetricResolution, "Statshouse hardware metric resolution")
 	f.IntVar(&argv.HardwareSlowMetricResolution, "hardware-slow-metric-resolution", default_.HardwareSlowMetricResolution, "Statshouse slow hardware metric resolution")
-	f.Var(&argv.StorageBackend, "storage-backend", "storage backend to query: \"clickhouse\" (default) or \"duck\" (aggregator shards over the structured query RPC)")
-	f.StringVar(&argv.DuckShardQueryAddrsStr, "duck-shard-query-addrs", default_.DuckShardQueryAddrsStr,
-		"per-shard store-query addresses of the aggregator shards under the duck backend, as comma-separated shard=host:port pairs with 1-based shard numbers")
-	f.IntVar(&argv.ShardByMetricShards, "shard-by-metric-shards", default_.ShardByMetricShards,
-		"number of shards for by-metric shard strategy. A copy from aggregator's config; under --storage-backend=duck, --duck-shard-query-addrs must cover shards 1..N")
 
 	f.BoolVar(&argv.RateLimitDisable, "rate-limit-disable", default_.RateLimitDisable, "disable rate limiting")
 	f.DurationVar(&argv.WindowDuration, "rate-limit-window-duration", default_.WindowDuration, "time window for analyzing ClickHouse requests")
@@ -238,6 +154,8 @@ func (argv *Config) Bind(f *flag.FlagSet, defaultI config.Config) {
 	f.Uint64Var(&argv.CheckCount, "rate-limit-check-count", default_.CheckCount, "successful checks needed to exit check stage")
 	f.StringVar(&argv.Announcement, "announcement", default_.Announcement, "announcement text to show user in UI")
 	f.StringVar(&argv.RQLiteAddrs, "rqlite-addrs", default_.RQLiteAddrs, "Comma-separated addresses of rqlite cluster")
+	f.Var(&argv.StorageBackend, "storage-backend", `where metric data is read from: "clickhouse" (default) or "duck" (the aggregators' embedded duck-stores, see --duck-shard-addrs)`)
+	config.StringSliceVar(f, &argv.DuckShardAddrs, "duck-shard-addrs", "", "duck-store: comma-separated RPC addresses of the aggregators, one per shard in shard order; every query reads all of them")
 	f.DurationVar(&argv.RecalcInterval, "recalc-interval-sleep-duration", default_.RecalcInterval, "rate limit state recalculation interval")
 }
 
@@ -250,7 +168,6 @@ func DefaultConfig() *Config {
 		CacheChunkSize:       5,
 		AvailableShardsStr:   "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16",
 		CHMaxShardConnsRatio: 20,
-		ShardByMetricShards:  16,
 		RateLimitConfig: chutil.RateLimitConfig{
 			WindowDuration:     2 * time.Minute,
 			MaxErrorRate:       20,
@@ -351,34 +268,4 @@ func parseShardKeys(shardsStr string) ([]uint32, error) {
 		shards = append(shards, uint32(shard))
 	}
 	return shards, nil
-}
-
-// parseDuckShardQueryAddrs parses --duck-shard-query-addrs: comma-separated
-// "shard=host:port" pairs with 1-based shard numbers. An empty address or a
-// repeated shard is a configuration error naming the offending pair.
-func parseDuckShardQueryAddrs(s string) (map[uint32]string, error) {
-	addrs := make(map[uint32]string)
-	for _, part := range strings.Split(s, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		shardStr, addr, found := strings.Cut(part, "=")
-		if !found {
-			return nil, fmt.Errorf("invalid --duck-shard-query-addrs entry %q: expected shard=host:port", part)
-		}
-		shard, err := strconv.ParseUint(strings.TrimSpace(shardStr), 10, 32)
-		if err != nil || shard == 0 {
-			return nil, fmt.Errorf("invalid --duck-shard-query-addrs entry %q: shard must be a positive number", part)
-		}
-		addr = strings.TrimSpace(addr)
-		if addr == "" {
-			return nil, fmt.Errorf("invalid --duck-shard-query-addrs entry %q: address is empty", part)
-		}
-		if _, exists := addrs[uint32(shard)]; exists {
-			return nil, fmt.Errorf("invalid --duck-shard-query-addrs entry %q: shard %d is listed twice", part, shard)
-		}
-		addrs[uint32(shard)] = addr
-	}
-	return addrs, nil
 }

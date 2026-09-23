@@ -39,10 +39,21 @@ type queryBuilder struct {
 	point       bool      // point query
 	play        int
 	utcOffset   int64
+	duck        bool // render for duck-store, set from sqlDialect when the query is built
 
 	// specific to queryKindTagValues, queryKindTagValueIDs
 	tag        format.MetricMetaTag
 	numResults int
+}
+
+// sqlDialect is what the rendered SQL takes from the storage backend rather
+// than from the query.
+type sqlDialect struct {
+	settings string // ClickHouse SETTINGS clause
+	// duck renders for duck-store, which accepts ClickHouse's table and
+	// function names (see duckstore.compatSQL) but not its INTERVAL
+	// arithmetic, parametric aggregates or backslash escapes.
+	duck bool
 }
 
 type listItemSeparator struct {
@@ -132,7 +143,18 @@ func (b *queryBuilder) colStr(tagX int) string {
 
 func (b *queryBuilder) raw64Expr(tagX int, lod *data_model.LOD) string {
 	raw64Hi := tagX + 1
+	if b.duck { // DuckDB's shift overflow-checks, so compose the uint64 in HUGEINT and wrap it into int64
+		return "CAST(((" + b.colInt(raw64Hi, lod) + "::BIGINT&4294967295)::HUGEINT*4294967296+(" + b.colInt(tagX, lod) +
+			"::BIGINT&4294967295)+9223372036854775808)%18446744073709551616-9223372036854775808 AS BIGINT)"
+	}
 	return "bitOr(bitShiftLeft(toInt64(toUInt32(" + b.colInt(raw64Hi, lod) + ")),32),toUInt32(" + b.colInt(tagX, lod) + "))"
+}
+
+func (b *queryBuilder) escape(s string) string {
+	if b.duck {
+		return strings.ReplaceAll(s, "'", "''")
+	}
+	return escapeReplacer.Replace(s)
 }
 
 func (b *queryBuilder) newListComma() listItemSeparator {

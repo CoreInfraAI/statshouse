@@ -15,6 +15,7 @@ import (
 
 func Test_getTableFromLODs(t *testing.T) {
 	t.Skip()
+	return
 	l, _ := time.LoadLocation("")
 	p := tableReqParams{
 		req: seriesRequest{numResults: 100, what: []promql.SelectorWhat{

@@ -19,12 +19,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ClickHouse/ch-go"
+	"github.com/ClickHouse/ch-go/proto"
 	"github.com/gorilla/mux"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 
 	"github.com/VKCOM/statshouse-go"
 
+	"github.com/VKCOM/statshouse/internal/chutil"
 	"github.com/VKCOM/statshouse/internal/data_model"
 	"github.com/VKCOM/statshouse/internal/format"
 	"github.com/VKCOM/statshouse/internal/promql"
@@ -769,21 +772,35 @@ func (h *requestHandler) QuerySeries(ctx context.Context, qry *promql.SeriesQuer
 
 func (h *requestHandler) QueryTagValueIDs(ctx context.Context, qry promql.TagValuesQuery) ([]int64, error) {
 	var (
-		pq = &tagValuesDataQuery{
-			user:       h.accessInfo.user,
+		pq = &queryBuilder{
 			metric:     qry.Metric,
 			tag:        qry.Tag,
 			numResults: math.MaxInt - 1,
-			idsOnly:    true,
 			utcOffset:  h.utcOffset,
 		}
 		tags = make(map[int64]bool)
 	)
 	for _, lod := range qry.Timescale.GetLODs(qry.Metric, qry.Offset) {
-		err := h.querySource().queryTagValues(ctx, h, pq, lod, func(row selectRow) error {
-			tags[row.valID] = true
-			return nil
-		})
+		query := pq.buildTagValueIDsQuery(lod, h.sqlDialect())
+		isFast := lod.FromSec+fastQueryTimeInterval >= lod.ToSec
+		sharded := pq.metric.Sharded()
+		err := h.doSelect(ctx, chutil.QueryMetaInto{
+			IsFast:         isFast,
+			IsLight:        true,
+			User:           h.accessInfo.user,
+			Metric:         qry.Metric,
+			Table:          lod.Table(sharded),
+			Sharded:        sharded,
+			DisableCHAddrs: h.disabledCHAddrs(),
+		}, ch.Query{
+			Body:   query.body,
+			Result: query.res,
+			OnResult: func(_ context.Context, b proto.Block) error {
+				for i := 0; i < b.Rows; i++ {
+					tags[query.rowAt(i).valID] = true
+				}
+				return nil
+			}})
 		if err != nil {
 			return nil, err
 		}

@@ -9,12 +9,15 @@
 package duckstore
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
+	"encoding/binary"
+	"errors"
 	"fmt"
-	"log"
+	"math"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,721 +25,435 @@ import (
 
 	"github.com/duckdb/duckdb-go/v2"
 
-	"github.com/VKCOM/statshouse/internal/vkgo/build"
+	"github.com/VKCOM/statshouse/internal/format"
 )
 
-// Directory names inside a store directory. The tree is created on first
-// start, so pointing duck-store at an empty directory is the whole setup.
+// The store is one DuckDB file per aggregator shard holding the three tier
+// tables. Every insert round appends each row to all three tiers with its time
+// truncated to the tier — the shape of ClickHouse's materialized views — in
+// one transaction. Queries always GROUP BY, so rows sharing a key are correct
+// as they are; compaction only folds them to save space: once a time bucket
+// has closed and received more than one round, its rows are collapsed in
+// place, the way AggregatingMergeTree merges parts. DuckDB's MVCC keeps
+// queries, inserts and compaction out of each other's way.
+
 const (
-	archiveSubdir    = "archive"
-	quarantineSubdir = "quarantine"
+	fileName        = "statshouse.duckdb"
+	compactInterval = 10 * time.Second
+	retainInterval  = time.Minute
+	sampleInterval  = 30 * time.Second
+	// closeGrace is how long past its end a bucket may still receive the
+	// conveyor's regular (non-historic) inserts; it is collapsed after that.
+	closeGrace       = 10 * time.Second
+	collapseBatchMax = 1000
 )
 
-// DefaultStatshouseVersion is the StatsHouse version stamped into files the
-// store creates. It comes from the build system; binaries built without
-// version ldflags stamp "dev" and accept each other's files.
-func DefaultStatshouseVersion() string {
-	if v := build.Version(); v != "" {
-		return v
-	}
-	return "dev"
-}
+var errOverloaded = errors.New("duck-store: overloaded, every query slot stayed busy until the deadline")
 
-// StoreConfig configures opening a store directory.
-type StoreConfig struct {
-	// Dir is the store directory the shard owns. It is created with
-	// everything the store needs on first start.
-	Dir string
-
-	// StatshouseVersion is the StatsHouse version stamped into files this
-	// store creates and verified against existing files' stamps. Defaults to
-	// DefaultStatshouseVersion().
-	StatshouseVersion string
-
-	// Logf receives quarantine and other operator-facing messages. Defaults
-	// to log.Printf.
-	Logf func(format string, args ...any)
-
-	// Metrics receives the count of files the open quarantined, per axis
-	// (QuarantinedFiles). Optional.
-	Metrics MetricsRecorder
-
-	// Resources are the DuckDB resource bounds applied to every store file
-	// the store opens: single-threaded, a memory limit and a bounded temp
-	// directory. The zero value takes the defaults.
-	Resources ResourcesConfig
-}
-
-// WindowFile is one archive window file that passed the version check and is
-// available to queries.
-type WindowFile struct {
-	Tier        string
-	WindowStart int64 // unix seconds
-	Path        string
-
-	// Sealed reports the file's sealed marker: the window's runs were rewritten
-	// into one and its contents never change again, so the file is opened
-	// read-only from then on.
-	Sealed bool
-}
-
-// QuarantineInfo records a store file that was quarantined on open: excluded
-// from queries, moved aside for deliberate reclamation, and counted.
-type QuarantineInfo struct {
-	Path   string // original path, before the file was moved aside
-	Reason string
-	Axis   QuarantineAxis // the version axis that disagreed, or unreadable
-}
-
-// Store is one shard's duck-store: the delta file the aggregator writes and
-// the archive windows compaction produces. Open verifies every file's version
-// stamp; files whose stamp disagrees with the running binary on any axis are
-// quarantined while the rest keep serving, so a version bump leaves the
-// process running instead of taking the shard down. It also finishes the
-// crash-recovery protocol: delta generations whose archive windows already
-// record them as consumed are unlinked, the rest are resumed (see
-// ConsumeGeneration).
 type Store struct {
-	cfg StoreConfig
+	cfg  Config
+	db   *sql.DB
+	sema chan struct{}
 
-	// storageVersion is the version of the DuckDB embedded in this binary,
-	// the second stamp axis.
-	storageVersion string
+	insertMu sync.Mutex
+	writer   *sql.Conn
 
-	// deltaSchemaVersion and archiveSchemaVersion are the schema-version
-	// axes this binary writes and verifies, one per file kind. They take the
-	// DeltaSchemaVersion and ArchiveSchemaVersion constants and exist as
-	// fields for one reason: the axes are meant to diverge — a delta layout
-	// change bumps only the delta axis — and a test can only pin that
-	// divergence by opening with the axes apart, which no constant-only
-	// shape can express. Nothing outside the package can configure them.
-	deltaSchemaVersion   int
-	archiveSchemaVersion int
+	mu       sync.Mutex
+	dirty    [3]map[int64]int // per tier: bucket start -> insert rounds since its last collapse
+	lastPass [2]time.Time     // last successful compaction, retention
 
-	// mu guards the fields below. The files themselves are serialized by
-	// DuckDB; this only keeps the in-memory view coherent across the writer,
-	// the consumer and readers.
-	mu        sync.RWMutex
-	delta     *sql.DB             // active delta generation, read-write
-	deltas    []int64             // all valid delta generations present, ascending
-	gen       int64               // active delta generation
-	rolledOff map[int64]time.Time // per rolled-off generation, when it stopped accepting writes — the backlog's age axis
-	writer    *Writer             // the store's single writer, when one is attached
-
-	// windowLocks is the per-archive-window lock registry (window_locks.go):
-	// one lock per window file — reference-counted, with a retiring state —
-	// instead of the store-global archive mutex it replaces, so a maintenance
-	// pass on one window no longer fences queries reading every other. Its
-	// doc comment states the per-file invariant, the refcount protocol and
-	// the lock ordering.
-	windowLocks windowLockRegistry
-
-	windows  []WindowFile
-	consumed map[windowKey]map[int64]struct{} // per archive window, the delta generations it already holds
-	evicted  map[windowKey]struct{}           // per successfully unlinked window: a tombstone marking "consumed, then evicted" so an absent s.consumed entry keeps meaning "never consumed" (see DropWindow)
-	// recollapsePending is the set of archive windows whose tables may hold
-	// more partial rows than the re-collapse factor allows: every window an
-	// append commits into is marked, and the sealer's sweep drains the set
-	// and rewrites the ones past the factor (seal.go). Bounded by the window
-	// count, in-memory only — an open re-seeds it from the unsealed windows
-	// it recovers, which is the same information a restart has.
-	recollapsePending map[windowKey]struct{}
-	leases            map[windowKey]int        // per archive window, the read leases queries hold; retention defers unlinks to them
-	deltaPins         map[int64]*deltaPinState // per delta generation, the read pins queries hold; consumption's unlink waits for them (see lease.go)
-	quarantined       []QuarantineInfo
+	stop chan struct{}
+	done chan struct{}
 }
 
-// OpenStore opens (creating on first start) the store in cfg.Dir.
-func OpenStore(cfg StoreConfig) (*Store, error) {
-	if cfg.Dir == "" {
-		return nil, fmt.Errorf("duck-store: store directory is not set")
-	}
-	if cfg.StatshouseVersion == "" {
-		cfg.StatshouseVersion = DefaultStatshouseVersion()
-	}
+// Open opens (creating if needed) the store in cfg.Dir and starts its
+// background maintenance. A file stamped with another SchemaVersion is moved
+// aside and replaced by an empty one.
+func Open(cfg Config) (*Store, error) {
 	if cfg.Logf == nil {
-		cfg.Logf = log.Printf
+		cfg.Logf = func(string, ...any) {}
 	}
-	cfg.Resources = cfg.Resources.WithDefaults()
-	storageVersion, err := embeddedDuckDBVersion()
+	if cfg.MemoryLimitBytes <= 0 {
+		cfg.MemoryLimitBytes = DefaultMemoryLimitBytes
+	}
+	if cfg.QueryConcurrency <= 0 {
+		cfg.QueryConcurrency = DefaultQueryConcurrency
+	}
+	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(cfg.Dir, fileName)
+	db, err := openDB(path, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("duck-store: %w", err)
+		return nil, err
 	}
-	s := &Store{
-		cfg:                  cfg,
-		storageVersion:       storageVersion,
-		deltaSchemaVersion:   DeltaSchemaVersion,
-		archiveSchemaVersion: ArchiveSchemaVersion,
-		consumed:             map[windowKey]map[int64]struct{}{},
-		evicted:              map[windowKey]struct{}{},
-		recollapsePending:    map[windowKey]struct{}{},
-		rolledOff:            map[int64]time.Time{},
-	}
-
-	// The directory tree is the whole setup: an operator points duck-store at
-	// a directory and everything it needs appears.
-	for _, dir := range []string{cfg.Dir, filepath.Join(cfg.Dir, archiveSubdir), filepath.Join(cfg.Dir, quarantineSubdir)} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, fmt.Errorf("duck-store: %w", err)
+	if version, ok := storedVersion(db); ok && version != SchemaVersion {
+		_ = db.Close()
+		aside := fmt.Sprintf("%s.v%d-%d", path, version, time.Now().Unix())
+		cfg.Logf("duck-store: %s has schema version %d, want %d: moving it to %s and starting empty", path, version, SchemaVersion, aside)
+		if err := os.Rename(path, aside); err != nil {
+			return nil, err
+		}
+		_ = os.Rename(path+".wal", aside+".wal")
+		if db, err = openDB(path, cfg); err != nil {
+			return nil, err
 		}
 	}
-
-	// Archives are scanned first: their consumed-generations records decide
-	// which delta files recovery unlinks.
-	if err := s.scanArchives(); err != nil {
+	s := &Store{cfg: cfg, db: db, sema: make(chan struct{}, cfg.QueryConcurrency), stop: make(chan struct{}), done: make(chan struct{})}
+	if err := s.init(); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
-	if err := s.openDeltas(); err != nil {
-		s.Close()
-		return nil, err
+	now := time.Now()
+	s.lastPass = [2]time.Time{now, now}
+	for i := range s.dirty {
+		s.dirty[i] = map[int64]int{}
 	}
-	s.reportQuarantined(cfg.Metrics)
+	// a restart forgets which buckets hold uncollapsed rows: revisit the recent coarse ones
+	for i, t := range tiers[1:] {
+		for b := now.Add(-2 * time.Hour).Unix(); b < now.Unix(); b += t.seconds {
+			s.dirty[i+1][b-b%t.seconds] = 2
+		}
+	}
+	go s.maintain()
 	return s, nil
 }
 
-// reportQuarantined tells the metrics recorder how many files this open
-// quarantined on each axis, so a version bump is visible as a metric and not
-// only as a log line. Axes with no files are not reported.
-func (s *Store) reportQuarantined(rec MetricsRecorder) {
-	if rec == nil || len(s.quarantined) == 0 {
-		return
-	}
-	counts := map[QuarantineAxis]int{}
-	for _, q := range s.quarantined {
-		counts[q.Axis]++
-	}
-	for axis, n := range counts {
-		rec.QuarantinedFiles(axis, n)
-	}
+func openDB(path string, cfg Config) (*sql.DB, error) {
+	dsn := fmt.Sprintf("%s?threads=1&memory_limit=%dB&max_temp_directory_size=%dB&temp_directory=%s",
+		path, cfg.MemoryLimitBytes, cfg.MemoryLimitBytes, filepath.Join(cfg.Dir, "tmp"))
+	return sql.Open("duckdb", dsn)
 }
 
-// Close releases the store's database handles. Files on disk are untouched.
+// storedVersion reports the file's stamp; ok is false for a fresh file.
+func storedVersion(db *sql.DB) (version int, ok bool) {
+	var tables int
+	if err := db.QueryRow("SELECT count(*) FROM duckdb_tables()").Scan(&tables); err != nil || tables == 0 {
+		return 0, false
+	}
+	if err := db.QueryRow("SELECT schema_version FROM duck_store_version").Scan(&version); err != nil {
+		return -1, true // tables without a stamp: not ours to read
+	}
+	return version, true
+}
+
+func (s *Store) init() (err error) {
+	ctx := context.Background()
+	if s.writer, err = s.db.Conn(ctx); err != nil {
+		return err
+	}
+	if err := registerFolds(s.writer); err != nil {
+		return err
+	}
+	stmts := []string{"CREATE TABLE IF NOT EXISTS duck_store_version (schema_version INTEGER NOT NULL)"}
+	for _, t := range tiers {
+		stmts = append(stmts, tierTableDDL(t.table))
+	}
+	stmts = append(stmts, compatSQL(s.cfg.ShardNum)...)
+	stmts = append(stmts, fmt.Sprintf("INSERT INTO duck_store_version SELECT %d WHERE NOT EXISTS (FROM duck_store_version)", SchemaVersion))
+	for _, stmt := range stmts {
+		if _, err := s.writer.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("duck-store: %s: %w", stmt, err)
+		}
+	}
+	return nil
+}
+
+// Close stops maintenance and closes the file.
 func (s *Store) Close() error {
-	s.mu.Lock()
-	db := s.delta
-	s.delta = nil
-	s.mu.Unlock()
-	if db == nil {
-		return nil
+	close(s.stop)
+	<-s.done
+	_ = s.writer.Close()
+	return s.db.Close()
+}
+
+// Insert durably stores one insert round: body is the RowBinary the
+// aggregator would send to ClickHouse's statshouse_v3_incoming.
+func (s *Store) Insert(ctx context.Context, body []byte) error {
+	s.insertMu.Lock()
+	defer s.insertMu.Unlock()
+	var buckets [3]map[int64]struct{}
+	for i := range buckets {
+		buckets[i] = map[int64]struct{}{}
 	}
-	return db.Close()
-}
-
-// Delta returns the read-write handle to the active delta generation.
-func (s *Store) Delta() *sql.DB {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.delta
-}
-
-// ActiveDeltaGeneration returns the generation of the delta file writes go to.
-func (s *Store) ActiveDeltaGeneration() int64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.gen
-}
-
-// DeltaGenerations returns every valid delta generation present, ascending.
-// Older generations hold rows consumption has not taken yet.
-func (s *Store) DeltaGenerations() []int64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return append([]int64(nil), s.deltas...)
-}
-
-// DeltaBacklog reports the store's ingestion backlog from in-memory state
-// alone: how many rolled-off delta generations still hold rows consumption
-// has not taken, and how long the oldest has waited since its roll. The
-// active generation never counts — holding recent rows is its job — and a
-// generation recovered from disk by an open reports the age since that open,
-// the earliest moment this process can vouch for. The read takes only mu,
-// held everywhere for in-memory map updates and nowhere across file work, so
-// it answers while maintenance holds the window locks: that is what makes it
-// safe for the liveness sampler.
-func (s *Store) DeltaBacklog() (generations int, oldestAge time.Duration) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	err := inTx(ctx, s.writer, func() error {
+		return s.writer.Raw(func(dc any) error {
+			var apps []*duckdb.Appender
+			var err error
+			for _, t := range tiers {
+				var a *duckdb.Appender
+				if a, err = duckdb.NewAppenderFromConn(dc.(driver.Conn), "", t.table); err != nil {
+					break
+				}
+				apps = append(apps, a)
+			}
+			vals := make([]driver.Value, len(keyColumns)+len(valueColumns))
+			if err == nil {
+				err = decodeIncoming(body, func(r *incomingRow) error {
+					vals[0] = r.metric
+					for i := range r.tags {
+						vals[2+2*i], vals[3+2*i] = r.tags[i], r.stags[i]
+					}
+					v := vals[len(keyColumns):]
+					for i, x := range r.values {
+						v[i] = x
+					}
+					for i, x := range r.states {
+						v[len(r.values)+i] = x
+					}
+					for i, t := range tiers {
+						ts := int64(r.time) - int64(r.time)%t.seconds
+						vals[1] = ts
+						if err := apps[i].AppendRow(vals...); err != nil {
+							return err
+						}
+						buckets[i][ts] = struct{}{}
+					}
+					return nil
+				})
+			}
+			for _, a := range apps { // closing flushes
+				if cerr := a.Close(); err == nil {
+					err = cerr
+				}
+			}
+			return err
+		})
+	})
+	if err != nil {
+		return err
+	}
 	now := time.Now()
-	for _, gen := range s.deltas {
-		if gen == s.gen {
-			continue // the active generation is the write target, not backlog
-		}
-		generations++
-		// Every rolled-off generation is stamped at its roll (or the open
-		// that found it); a missing stamp can only mean clock trouble, and
-		// reporting age zero understates rather than alarms.
-		if rolled, ok := s.rolledOff[gen]; ok {
-			if age := now.Sub(rolled); age > oldestAge {
-				oldestAge = age
-			}
-		}
-	}
-	return generations, oldestAge
-}
-
-// Windows returns the archive windows that passed the version check, ordered
-// by tier and window start.
-func (s *Store) Windows() []WindowFile {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return append([]WindowFile(nil), s.windows...)
-}
-
-// Quarantined returns the files quarantined by the most recent OpenStore, with
-// the reason each was excluded. The count is the length.
-func (s *Store) Quarantined() []QuarantineInfo {
-	return append([]QuarantineInfo(nil), s.quarantined...)
-}
-
-// openDeltas scans delta-<generation>.duckdb files, quarantines the ones the
-// running binary cannot vouch for, finishes unlinking the generations whose
-// archives already record them as consumed, resumes the physically newest
-// generation as active when it is valid, and otherwise — the newest was
-// quarantined or unlinked, so every survivor was already sealed by a roll —
-// keeps the survivors for consumption to resume on and creates the next
-// fresh generation as active.
-func (s *Store) openDeltas() error {
-	entries, err := os.ReadDir(s.cfg.Dir)
-	if err != nil {
-		return fmt.Errorf("duck-store: %w", err)
-	}
-	var gens []int64
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		if gen, ok := parseDeltaFileName(e.Name()); ok {
-			gens = append(gens, gen)
-		}
-	}
-	sort.Slice(gens, func(i, j int) bool { return gens[i] < gens[j] })
-
-	var maxSeen int64 = -1
-	var valid []int64
-	for _, gen := range gens {
-		maxSeen = gen
-		if s.verifyDeltaGeneration(gen) {
-			valid = append(valid, gen)
-		}
-	}
-
-	// Every generation but the newest was sealed by a roll, so its rows are
-	// on their way into archive windows: unlink the ones already recorded as
-	// consumed, keep the rest for consumption to resume on. The one exempt
-	// from that fate is the physically newest generation on disk (maxSeen,
-	// whatever became of it): a generation still being written cannot have
-	// been consumed, so it resumes as the active one. When no valid
-	// generation is the physically newest — the newest was quarantined or
-	// already unlinked — every survivor was sealed by a roll before it: none
-	// of them resumes active (writes into a rolled-off, possibly
-	// half-consumed file would re-serve rows its windows already hold), they
-	// all wait for consumption, and a fresh generation takes over.
-	deltas := make([]int64, 0, len(valid))
-	resumed := false
-	opened := time.Now()
-	for _, gen := range valid {
-		if gen != maxSeen && s.unlinkDeltaIfConsumed(gen) {
-			continue
-		}
-		if gen == maxSeen {
-			resumed = true
-		} else {
-			// A survivor below the newest was sealed by a roll before this
-			// open; the exact moment died with the previous process, so the
-			// backlog's age for it counts from here — the earliest this
-			// process can vouch for.
-			s.rolledOff[gen] = opened
-		}
-		deltas = append(deltas, gen)
-	}
-
-	if !resumed {
-		// No valid generation is the physically newest one — every survivor
-		// was sealed by a roll, or nothing survived. Start the next
-		// generation number so a quarantined, consumed or shadowed file is
-		// never reused.
-		gen := maxSeen + 1
-		path := filepath.Join(s.cfg.Dir, deltaFileName(gen))
-		if err := createFile(path, deltaTables(), s.currentStamp(fileKindDelta), s.cfg.Resources); err != nil {
-			return fmt.Errorf("duck-store: %w", err)
-		}
-		deltas = append(deltas, gen)
-	}
-	s.deltas = deltas
-
-	// Resume the newest valid generation: writes go to it, older ones wait
-	// for consumption to take them.
-	s.gen = s.deltas[len(s.deltas)-1]
-	db, err := openStoreFile(filepath.Join(s.cfg.Dir, deltaFileName(s.gen)), false, s.cfg.Resources)
-	if err != nil {
-		return fmt.Errorf("duck-store: %w", err)
-	}
-	s.delta = db
-	return nil
-}
-
-// verifyDeltaGeneration checks a delta generation file against this binary
-// and reports whether the store can vouch for it; failures quarantine the
-// file while the rest keep opening.
-func (s *Store) verifyDeltaGeneration(gen int64) bool {
-	path := filepath.Join(s.cfg.Dir, deltaFileName(gen))
-	db, err := openStoreFile(path, false, s.cfg.Resources)
-	if err != nil {
-		s.quarantineFile(path, fmt.Sprintf("cannot open: %v", err), QuarantineUnreadable)
-		return false
-	}
-	defer db.Close()
-	st, err := s.verifyStamp(db, path, fileKindDelta)
-	if err != nil {
-		s.quarantineFile(path, err.Error(), s.stampMismatchAxis(st, fileKindDelta))
-		return false
-	}
-	return true
-}
-
-// stampMismatchAxis names the axis a stamp verifyStamp rejected for a file of
-// the given kind: which of the version axes disagreed — the kind's own
-// schema axis, DuckDB's storage format, the StatsHouse version — or that
-// there was no readable stamp to compare at all.
-func (s *Store) stampMismatchAxis(st stamp, kind fileKind) QuarantineAxis {
-	if st.storageVersion == "" && st.schemaVersion == 0 {
-		return QuarantineUnreadable
-	}
-	cur := s.currentStamp(kind)
-	switch {
-	case st.schemaVersion != cur.schemaVersion:
-		if kind == fileKindDelta {
-			return QuarantineDeltaSchema
-		}
-		return QuarantineArchiveSchema
-	case st.storageVersion != cur.storageVersion:
-		return QuarantineStorage
-	default:
-		return QuarantineStatshouse
-	}
-}
-
-// staleWindowTemp reports whether name is a leftover temporary of a window
-// file this store creates: an archive window name under the .tmp suffix
-// createArchiveWindow builds with, or the write-ahead log DuckDB may leave
-// next to it. Foreign files ending in .tmp do not match — the store never
-// creates them and must not delete them.
-func staleWindowTemp(name string) bool {
-	for _, suffix := range []string{windowTmpSuffix + ".wal", windowTmpSuffix} {
-		if base, ok := strings.CutSuffix(name, suffix); ok {
-			_, _, isWindow := parseArchiveFileName(base)
-			return isWindow
-		}
-	}
-	return false
-}
-
-// scanArchives verifies the version stamp of every archive window file,
-// keeping the valid ones for queries with their consumed-generations records,
-// and quarantining the rest.
-func (s *Store) scanArchives() error {
-	entries, err := os.ReadDir(filepath.Join(s.cfg.Dir, archiveSubdir))
-	if err != nil {
-		return fmt.Errorf("duck-store: %w", err)
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		// A window file mid-creation (createArchiveWindow builds under a
-		// temporary name): a leftover can only come from a crashed attempt,
-		// whose retry rebuilds it from scratch, so sweep it here instead of
-		// letting it linger next to the window it never became. Only names
-		// this store could have created — an archive window name under the
-		// temporary suffix: the archive directory tolerates foreign files
-		// everywhere else, and an unrelated operator file ending in .tmp is
-		// not the store's to delete. A failed removal is logged, not fatal:
-		// the retry path clears the stale temporary itself, so a failed sweep
-		// only leaves the leftover where it lies.
-		if staleWindowTemp(e.Name()) {
-			path := filepath.Join(s.cfg.Dir, archiveSubdir, e.Name())
-			if err := os.Remove(path); err != nil {
-				s.cfg.Logf("[error] duck-store: failed to remove stale temporary %s: %v", path, err)
-			}
-			continue
-		}
-		tier, windowStart, ok := parseArchiveFileName(e.Name())
-		if !ok {
-			continue
-		}
-		path := filepath.Join(s.cfg.Dir, archiveSubdir, e.Name())
-		db, err := openStoreFile(path, true, s.cfg.Resources)
-		if err != nil {
-			s.quarantineFile(path, fmt.Sprintf("cannot open: %v", err), QuarantineUnreadable)
-			continue
-		}
-		st, err := s.verifyStamp(db, path, fileKindArchive)
-		axis := QuarantineUnreadable
-		if err != nil {
-			axis = s.stampMismatchAxis(st, fileKindArchive)
-		}
-		var sealed bool
-		if err == nil {
-			// The consumed-generations records drive crash recovery and the
-			// sealed marker drives write refusal, so a stamped file that
-			// cannot give either of them up is as unusable as a mismatching
-			// one.
-			var recorded map[int64]struct{}
-			recorded, err = readConsumed(db)
-			if err == nil {
-				sealed, err = readSealed(db)
-			}
-			if err == nil {
-				s.consumed[windowKey{tier: tier, start: windowStart}] = recorded
-			} else {
-				err = fmt.Errorf("cannot read metadata: %v", err)
-			}
-		}
-		db.Close()
-		if err != nil {
-			s.quarantineFile(path, err.Error(), axis)
-			continue
-		}
-		s.windows = append(s.windows, WindowFile{Tier: tier, WindowStart: windowStart, Path: path, Sealed: sealed})
-		if !sealed {
-			// A window recovered unsealed may hold partial runs a previous
-			// process's sealer never folded, and no append of this process's
-			// own will mark it — the open owes it the re-collapse check.
-			s.markRecollapseLocked(windowKey{tier: tier, start: windowStart})
-		}
-	}
-	sort.Slice(s.windows, func(i, j int) bool { return lessWindow(s.windows[i], s.windows[j]) })
-	return nil
-}
-
-// stamp is the single row of the version-stamp table: the three version axes
-// of the binary that wrote the file.
-type stamp struct {
-	schemaVersion     int
-	storageVersion    string
-	statshouseVersion string
-}
-
-// currentStamp is the stamp the running binary writes into files of the
-// given kind it creates: the kind's own schema-version axis plus the two
-// axes shared by every file.
-func (s *Store) currentStamp(kind fileKind) stamp {
-	var schemaVersion int
-	switch kind {
-	case fileKindDelta:
-		schemaVersion = s.deltaSchemaVersion
-	default:
-		schemaVersion = s.archiveSchemaVersion
-	}
-	return stamp{
-		schemaVersion:     schemaVersion,
-		storageVersion:    s.storageVersion,
-		statshouseVersion: s.cfg.StatshouseVersion,
-	}
-}
-
-// verifyStamp reads path's version-stamp table and demands an exact match
-// with the running binary on every axis for a file of the given kind: the
-// kind's own duck-store schema axis (a delta file against the delta axis, an
-// archive window against the archive axis — the axes are verified
-// independently, so they can move independently), DuckDB storage and
-// StatsHouse. A file written by a different version is refused rather than
-// misread; there is no in-place upgrade and no compatibility shim. The
-// returned stamp is the file's own, for logging.
-func (s *Store) verifyStamp(db *sql.DB, path string, kind fileKind) (stamp, error) {
-	var st stamp
-	err := db.QueryRow("SELECT schema_version, storage_version, statshouse_version FROM "+VersionTable).
-		Scan(&st.schemaVersion, &st.storageVersion, &st.statshouseVersion)
-	if err != nil {
-		return st, fmt.Errorf("no %s table: %v", VersionTable, err)
-	}
-	cur := s.currentStamp(kind)
-	switch {
-	case st.schemaVersion != cur.schemaVersion:
-		return st, fmt.Errorf("duck-store %s schema version mismatch: file has %d, this binary writes %d",
-			kind.label(), st.schemaVersion, cur.schemaVersion)
-	case st.storageVersion != cur.storageVersion:
-		return st, fmt.Errorf("DuckDB storage version mismatch: file was written by DuckDB %q, this binary embeds %q",
-			st.storageVersion, cur.storageVersion)
-	case st.statshouseVersion != cur.statshouseVersion:
-		return st, fmt.Errorf("StatsHouse version mismatch: file was written by statshouse %q, this binary is %q",
-			st.statshouseVersion, cur.statshouseVersion)
-	}
-	return st, nil
-}
-
-// quarantineFile moves an unreadable or version-mismatching store file into
-// the quarantine directory — out of queries, but kept on disk for deliberate
-// reclamation — and records it with the axis that excluded it. The store
-// keeps opening and serving the rest.
-func (s *Store) quarantineFile(path, reason string, axis QuarantineAxis) {
-	dst := uniquePath(filepath.Join(s.cfg.Dir, quarantineSubdir, filepath.Base(path)))
-	// DuckDB may leave a write-ahead log next to the file; move it along so
-	// the quarantined file is not split from it.
-	if err := os.Rename(path, dst); err != nil {
-		// The file stays where it is, still excluded from serving; the next
-		// open re-detects and retries the move. It is not recorded: a count
-		// of files the quarantine directory does not hold would mislead the
-		// reclamation workflow.
-		s.cfg.Logf("[error] duck-store: failed to quarantine %s (%s): %v", path, reason, err)
-		return
-	}
-	_ = os.Rename(path+".wal", dst+".wal")
-	s.cfg.Logf("[error] duck-store: quarantined %s: %s", path, reason)
-	s.quarantined = append(s.quarantined, QuarantineInfo{Path: path, Reason: reason, Axis: axis})
-}
-
-// dsnBytes renders a byte count as a DuckDB size option value. The DSN parser
-// rejects bare byte integers for the size options ("could not set invalid or
-// local option"); an explicit B suffix is exact for any byte count and is what
-// current_setting reports back in MiB.
-func dsnBytes(n int64) string {
-	return strconv.FormatInt(n, 10) + "B"
-}
-
-// openStoreFile opens a store file; readOnly picks the access mode, res the
-// DuckDB resource bounds for the file's database instance (a zero res takes
-// the defaults). Any open failure (a corrupt or foreign file, a newer DuckDB
-// storage format, ...) is returned to the caller, which quarantines the file.
-// The bounds ride as DSN options rather than SET statements, so they hold from
-// the first connection and every caller opening the same path agrees on them
-// (the driver shares one database instance per file).
-func openStoreFile(path string, readOnly bool, res ResourcesConfig) (*sql.DB, error) {
-	res = res.WithDefaults()
-	var opts []string
-	if readOnly {
-		opts = append(opts, "access_mode=READ_ONLY")
-	}
-	opts = append(opts,
-		"threads="+strconv.Itoa(res.Threads),
-		"memory_limit="+dsnBytes(res.MemoryLimitBytes),
-		"max_temp_directory_size="+dsnBytes(res.MaxTempDirBytes))
-	dsn := path + "?" + strings.Join(opts, "&")
-	c, err := duckdb.NewConnector(dsn, nil)
-	if err != nil {
-		return nil, err
-	}
-	return sql.OpenDB(c), nil
-}
-
-// createFile creates a new store file with the given tables, the metadata
-// tables and the version stamp. Delta generations and archive windows are
-// created the same way, so every file the store owns carries the same stamp
-// and the same metadata. The database is closed again; callers open it through
-// their own handle. A file already stamped by this binary is left as it was,
-// so re-running against a leftover is harmless. When it returns successfully,
-// the schema and stamp are checkpointed into the main file itself, so no
-// write-ahead log needs to survive alongside it.
-func createFile(path string, tables []string, st stamp, res ResourcesConfig) error {
-	db, err := openStoreFile(path, false, res)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	// DuckDB would flush the log on close anyway, but silently: a
-	// shutdown-checkpoint failure (disk full, I/O error) cannot stop the
-	// publication. Disable it, so the explicit checkpoint below is the one
-	// flush that happens and its failure is the only way this can end.
-	if _, err := db.Exec("PRAGMA disable_checkpoint_on_shutdown"); err != nil {
-		return fmt.Errorf("disable shutdown checkpoint of %s: %w", path, err)
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	for _, t := range tables {
-		if _, err := tx.Exec(tierTableDDL(t)); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("create %s in %s: %w", t, path, err)
-		}
-	}
-	if _, err := tx.Exec(VersionTableDDL); err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("create %s in %s: %w", VersionTable, path, err)
-	}
-	if _, err := tx.Exec(ConsumedTableDDL); err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("create %s in %s: %w", ConsumedTable, path, err)
-	}
-	if _, err := tx.Exec(SealedTableDDL); err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("create %s in %s: %w", SealedTable, path, err)
-	}
-	var stamped int
-	if err := tx.QueryRow("SELECT count(*) FROM " + VersionTable).Scan(&stamped); err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("read %s in %s: %w", VersionTable, path, err)
-	}
-	if stamped == 0 {
-		if _, err := tx.Exec("INSERT INTO "+VersionTable+" VALUES ($1, $2, $3)",
-			st.schemaVersion, st.storageVersion, st.statshouseVersion); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("stamp %s in %s: %w", VersionTable, path, err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	// The commit lands in the write-ahead log, and the shutdown checkpoint
-	// is disabled above — so this explicit checkpoint is what moves the
-	// schema and the stamp into the main file. Archive-window creation
-	// renames the file into place and discards the temporary's log, so a
-	// schema that still lived only in the log would be published tableless
-	// at the final path — where the consume path's existence check skips
-	// rebuilding it forever. Checkpointing here lets a failure (disk full,
-	// I/O error) stop the publication; the leftover temporary pair is
-	// removed and rebuilt by the next attempt.
-	if _, err := db.Exec("CHECKPOINT"); err != nil {
-		return fmt.Errorf("checkpoint %s: %w", path, err)
-	}
-	return nil
-}
-
-// embeddedDuckDBVersion returns the version of the DuckDB library linked into
-// this binary, discovered through a throwaway in-memory database.
-func embeddedDuckDBVersion() (string, error) {
-	c, err := duckdb.NewConnector(":memory:", nil)
-	if err != nil {
-		return "", fmt.Errorf("cannot open in-memory DuckDB to discover its version: %w", err)
-	}
-	db := sql.OpenDB(c)
-	defer db.Close()
-	var version string
-	if err := db.QueryRow("SELECT version()").Scan(&version); err != nil {
-		return "", fmt.Errorf("cannot read embedded DuckDB version: %w", err)
-	}
-	return version, nil
-}
-
-// deltaTables is the table list a delta generation file carries: the 1s tier
-// alone (see DeltaSchemaVersion 5). The coarser tiers are derived views over
-// those 1s rows, never stored in a delta.
-func deltaTables() []string {
-	return []string{tierTables[Tier1s]}
-}
-
-func tierOrder(tier string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for i, t := range tiers {
-		if t == tier {
-			return i
+		for b := range buckets[i] {
+			if n, ok := s.dirty[i][b]; ok {
+				s.dirty[i][b] = n + 1
+			} else if closed(b, t, now) {
+				s.dirty[i][b] = 2 // a late round into a bucket that already holds rows
+			} else {
+				s.dirty[i][b] = 1
+			}
 		}
 	}
-	return len(tiers)
+	return nil
 }
 
-// uniquePath returns path itself, or path with a numeric suffix if it already
-// exists, so moving a file aside never overwrites an earlier quarantine. A
-// stat error other than existence also counts as free: a directory that
-// cannot be stat'ed never yields the NotExist verdict the wait is for, while
-// a wrong guess makes the caller's rename fail loudly instead.
-func uniquePath(path string) string {
-	if _, err := os.Stat(path); err != nil {
-		return path
+func closed(bucket int64, t tier, now time.Time) bool {
+	return bucket+t.seconds+int64(closeGrace/time.Second) <= now.Unix()
+}
+
+// inTx runs fn inside an explicit transaction on conn. It is issued through
+// the connection rather than sql.Tx because a duckdb.Appender cannot take part
+// in an sql.Tx.
+func inTx(ctx context.Context, conn *sql.Conn, fn func() error) error {
+	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
+		return err
 	}
-	for n := 1; ; n++ {
-		candidate := fmt.Sprintf("%s.%d", path, n)
-		if _, err := os.Stat(candidate); err != nil {
-			return candidate
+	if err := fn(); err != nil {
+		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		return err
+	}
+	_, err := conn.ExecContext(ctx, "COMMIT")
+	return err
+}
+
+// Query runs one SELECT and returns its columns in ClickHouse Native encoding.
+func (s *Store) Query(ctx context.Context, query string) (rows int, cols [][]byte, err error) {
+	start := time.Now()
+	select {
+	case s.sema <- struct{}{}:
+	case <-ctx.Done():
+		s.record(format.BuiltinMetricMetaDuckQueryTime, time.Since(start).Seconds(), format.TagValueIDDuckQueryRefused)
+		return 0, nil, errOverloaded
+	}
+	defer func() {
+		<-s.sema
+		s.record(format.BuiltinMetricMetaDuckQueryTime, time.Since(start).Seconds(), statusTag(err))
+	}()
+	if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "SELECT") {
+		return 0, nil, fmt.Errorf("duck-store: only SELECT is served")
+	}
+	r, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer r.Close()
+	types, err := r.ColumnTypes()
+	if err != nil {
+		return 0, nil, err
+	}
+	cols = make([][]byte, len(types))
+	vals := make([]any, len(types))
+	ptrs := make([]any, len(types))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	for r.Next() {
+		if err := r.Scan(ptrs...); err != nil {
+			return 0, nil, err
+		}
+		for i, v := range vals {
+			if cols[i], err = appendNative(cols[i], v); err != nil {
+				return 0, nil, fmt.Errorf("duck-store: column %s: %w", types[i].Name(), err)
+			}
+		}
+		rows++
+	}
+	return rows, cols, r.Err()
+}
+
+// appendNative appends one value in ClickHouse Native encoding; the SQL's
+// column types line up with the ClickHouse columns the API decodes into.
+// Aggregate states are stored in ClickHouse's own encoding already.
+func appendNative(buf []byte, v any) ([]byte, error) {
+	switch v := v.(type) {
+	case int32:
+		return binary.LittleEndian.AppendUint32(buf, uint32(v)), nil
+	case uint32:
+		return binary.LittleEndian.AppendUint32(buf, v), nil
+	case int64:
+		return binary.LittleEndian.AppendUint64(buf, uint64(v)), nil
+	case float64:
+		return binary.LittleEndian.AppendUint64(buf, math.Float64bits(v)), nil
+	case string:
+		return append(binary.AppendUvarint(buf, uint64(len(v))), v...), nil
+	case []byte:
+		return append(buf, v...), nil
+	default:
+		return buf, fmt.Errorf("unsupported value %T", v)
+	}
+}
+
+func (s *Store) maintain() {
+	defer close(s.done)
+	compact := time.NewTicker(compactInterval)
+	retain := time.NewTicker(retainInterval)
+	sample := time.NewTicker(sampleInterval)
+	defer compact.Stop()
+	defer retain.Stop()
+	defer sample.Stop()
+	for {
+		select {
+		case <-s.stop:
+			return
+		case <-compact.C:
+			s.pass(0, format.TagValueIDDuckMaintenanceCompaction, s.compact)
+		case <-retain.C:
+			s.pass(1, format.TagValueIDDuckMaintenanceRetention, s.retain)
+		case <-sample.C:
+			s.sample()
 		}
 	}
+}
+
+func (s *Store) pass(i int, kind int32, fn func(context.Context, *sql.Conn) error) {
+	start := time.Now()
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err == nil {
+		err = fn(ctx, conn)
+		_ = conn.Close()
+	}
+	if err != nil {
+		s.cfg.Logf("duck-store: maintenance pass failed: %v", err)
+	} else {
+		s.mu.Lock()
+		s.lastPass[i] = time.Now()
+		s.mu.Unlock()
+	}
+	s.record(format.BuiltinMetricMetaDuckMaintenanceTime, time.Since(start).Seconds(), kind, statusTag(err))
+}
+
+// compact collapses every closed bucket that received more than one round.
+func (s *Store) compact(ctx context.Context, conn *sql.Conn) error {
+	now := time.Now()
+	for i, t := range tiers {
+		var due []string
+		s.mu.Lock()
+		for b, n := range s.dirty[i] {
+			if closed(b, t, now) {
+				if n > 1 {
+					due = append(due, strconv.FormatInt(b, 10))
+				}
+				delete(s.dirty[i], b)
+			}
+		}
+		s.mu.Unlock()
+		for len(due) != 0 {
+			batch := due[:min(len(due), collapseBatchMax)]
+			err := inTx(ctx, conn, func() error {
+				for _, stmt := range collapseSQL(t.table, strings.Join(batch, ",")) {
+					if _, err := conn.ExecContext(ctx, stmt); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				s.mu.Lock()
+				for _, b := range due { // retry on the next pass
+					ts, _ := strconv.ParseInt(b, 10, 64)
+					s.dirty[i][ts] = max(s.dirty[i][ts], 2)
+				}
+				s.mu.Unlock()
+				return fmt.Errorf("collapse %s: %w", t.table, err)
+			}
+			due = due[len(batch):]
+		}
+	}
+	return nil
+}
+
+func (s *Store) retain(ctx context.Context, conn *sql.Conn) error {
+	for i, retention := range []time.Duration{s.cfg.Retention1s, s.cfg.Retention1m, s.cfg.Retention1h} {
+		if retention <= 0 {
+			continue
+		}
+		cutoff := time.Now().Add(-retention).Unix()
+		if _, err := conn.ExecContext(ctx, "DELETE FROM "+tiers[i].table+" WHERE time < ?", cutoff); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) sample() {
+	var blockSize, used, free int64
+	err := s.db.QueryRow("SELECT block_size, used_blocks, free_blocks FROM pragma_database_size() WHERE database_name = current_database()").Scan(&blockSize, &used, &free)
+	if err == nil {
+		s.record(format.BuiltinMetricMetaDuckStoreSize, float64(blockSize*used), format.TagValueIDDuckSizeUsed)
+		s.record(format.BuiltinMetricMetaDuckStoreSize, float64(blockSize*free), format.TagValueIDDuckSizeFree)
+	}
+	now := time.Now()
+	s.mu.Lock()
+	var backlog [3]int
+	for i, t := range tiers {
+		for b, n := range s.dirty[i] {
+			if n > 1 && closed(b, t, now) {
+				backlog[i]++
+			}
+		}
+	}
+	lastPass := s.lastPass
+	s.mu.Unlock()
+	for i, tag := range []int32{format.TagValueIDDuckTier1s, format.TagValueIDDuckTier1m, format.TagValueIDDuckTier1h} {
+		s.record(format.BuiltinMetricMetaDuckBacklog, float64(backlog[i]), tag)
+	}
+	s.record(format.BuiltinMetricMetaDuckMaintenanceAge, now.Sub(lastPass[0]).Seconds(), format.TagValueIDDuckMaintenanceCompaction)
+	s.record(format.BuiltinMetricMetaDuckMaintenanceAge, now.Sub(lastPass[1]).Seconds(), format.TagValueIDDuckMaintenanceRetention)
+}
+
+func (s *Store) record(meta *format.MetricMetaValue, value float64, tags ...int32) {
+	if s.cfg.Metrics != nil {
+		s.cfg.Metrics.AddValueCounter(uint32(time.Now().Unix()), meta, append([]int32{0}, tags...), value, 1)
+	}
+}
+
+func statusTag(err error) int32 {
+	if err != nil {
+		return format.TagValueIDStatusError
+	}
+	return format.TagValueIDStatusOK
 }

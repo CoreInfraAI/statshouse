@@ -70,6 +70,7 @@ var argv struct {
 	chV2MaxLightSlowConns    int
 	chV2MaxHardwareFastConns int
 	chV2MaxHardwareSlowConns int
+	ShardByMetricShards      int
 
 	chV2Password             string
 	chV2PasswordFile         string
@@ -250,10 +251,6 @@ func run() int {
 	if len(rpcCryptoKeys) > 0 {
 		rpcCryptoKey = rpcCryptoKeys[0]
 	}
-	// The duck fan-out clients dial the aggregator shards' store-query
-	// listeners — cross-process peers, so their handshakes need the same key
-	// the metadata client presents.
-	argv.Config.DuckQueryRPCCryptoKey = rpcCryptoKey
 
 	staticFS := statshouseui.FS()
 	if staticFS == nil {
@@ -526,9 +523,7 @@ func parseCommandLine() (err error) {
 	flag.IntVar(&argv.chV2MaxHeavySlowConns, "clickhouse-v2-max-heavy-slow-conns", 1, "maximum number of ClickHouse-v2 connections (heavy slow)")
 	flag.IntVar(&argv.chV2MaxHardwareFastConns, "clickhouse-v2-max-hardware-fast-conns", 2, "maximum number of ClickHouse-v2 connections (hardware fast)")
 	flag.IntVar(&argv.chV2MaxHardwareSlowConns, "clickhouse-v2-max-hardware-slow-conns", 1, "maximum number of ClickHouse-v2 connections (hardware slow)")
-	// --shard-by-metric-shards moved into api.Config.Bind: the config listener
-	// reparses the API's own flag surface line by line, and the duck backend
-	// cross-validates the count against --duck-shard-query-addrs.
+	flag.IntVar(&argv.ShardByMetricShards, "shard-by-metric-shards", 16, "number of shards for by-metric shard strategy. A copy from aggregator's config")
 
 	flag.StringVar(&argv.chV2Password, "clickhouse-v2-password", "", "ClickHouse-v2 password")
 	flag.StringVar(&argv.chV2PasswordFile, "clickhouse-v2-password-file", "", "file with ClickHouse-v2 password")
@@ -572,11 +567,12 @@ func parseCommandLine() (err error) {
 	if len(flag.Args()) != 0 {
 		return fmt.Errorf("unexpected command line arguments, check command line for typos: %q", flag.Args())
 	}
-	chV2Addrs, err := chV2AddrsOrDefault(argv.chV2Addrs, argv.Config.StorageBackend)
-	if err != nil {
-		return err
+	if len(argv.chV2Addrs) == 0 && argv.Config.StorageBackend == duckstore.BackendDuck {
+		argv.chV2Addrs = []string{"127.0.0.1:9"} // the pool is never queried under duck, and dials nothing on its own
 	}
-	argv.chV2Addrs = chV2Addrs
+	if len(argv.chV2Addrs) == 0 {
+		return fmt.Errorf("--clickhouse-v2-addrs must be specified")
+	}
 	if argv.cacheDir == "" {
 		return fmt.Errorf("--cache-dir must be specified")
 	}
@@ -605,26 +601,4 @@ func parseCommandLine() (err error) {
 	}
 
 	return argv.HandlerOptions.Parse()
-}
-
-// duckChV2PlaceholderAddr is the inert loopback address the ClickHouse-v2 pool
-// is built over under the duck backend, where no ClickHouse exists. The pool
-// dials nothing on its own (it creates no idle connections and the health
-// check only maintains the — zero — minimum), and no query reaches it either:
-// under duck every read goes through the QuerySource seam to the aggregator
-// shards. OpenClickHouse merely refuses an empty address list, so the
-// placeholder only exists to satisfy that.
-const duckChV2PlaceholderAddr = "127.0.0.1:9"
-
-// chV2AddrsOrDefault validates the ClickHouse-v2 address list against the
-// selected storage backend: clickhouse needs a real list, duck runs without
-// one (--duck-shard-query-addrs names where its queries go instead).
-func chV2AddrsOrDefault(addrs []string, backend duckstore.StorageBackend) ([]string, error) {
-	if len(addrs) > 0 {
-		return addrs, nil
-	}
-	if backend != duckstore.BackendDuck {
-		return nil, fmt.Errorf("--clickhouse-v2-addrs must be specified")
-	}
-	return []string{duckChV2PlaceholderAddr}, nil
 }

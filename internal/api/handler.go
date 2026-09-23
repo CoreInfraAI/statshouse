@@ -132,14 +132,7 @@ const (
 
 	cacheInvalidateCheckInterval = 1 * time.Second
 	cacheInvalidateCheckTimeout  = 5 * time.Second
-	// the cache-invalidation poll's LOD needs an upper time bound the old
-	// hand-written SQL did not have; a day of look-ahead past now covers every
-	// contributor-log row storage can hold
-	cacheInvalidateLookAhead = 24 * time.Hour
-
-	// how many decoded rows loadPoints batches between cache2 inflight size
-	// estimate updates (the pre-seam code updated once per ClickHouse block)
-	cache2InflightApproxRows = 4096
+	cacheInvalidateMaxRows       = 100_000
 
 	queryClientCache               = 1 * time.Second
 	queryClientCacheStale          = 9 * time.Second // ~ v2 lag
@@ -202,7 +195,7 @@ type (
 		indexTemplate         *template.Template
 		indexSettings         string
 		ch                    *chutil.ClickHouse
-		querySource           QuerySource
+		duck                  *duckShards // non-nil with --storage-backend=duck: reads go to the aggregators instead of ch
 		metricsStorage        *metajournal.MetricsStorage
 		journalFast           *metajournal.JournalFast
 		cache2                *cache2
@@ -612,21 +605,16 @@ func NewHandler(staticDir fs.FS, jsSettings JSSettings, showInvisible bool, chV2
 		mappingsTracker = mappings_tracker.New()
 	}
 	h := &Handler{
-		HandlerOptions:  opt,
-		showInvisible:   showInvisible,
-		staticDir:       http.FS(staticDir),
-		indexTemplate:   tmpl,
-		indexSettings:   string(settings),
-		metadataLoader:  metadataLoader,
-		mappingsStorage: mappingsStorage,
-		mappingsTracker: mappingsTracker,
-		ch:              chV2,
-		querySource: newQuerySource(cfg.StorageBackend, duckQuerySourceConfig{
-			addrs:     cfg.DuckShardQueryAddrs,
-			numShards: cfg.ShardByMetricShards,
-			cryptoKey: cfg.DuckQueryRPCCryptoKey,
-			journal:   metricStorage,
-		}),
+		HandlerOptions:        opt,
+		showInvisible:         showInvisible,
+		staticDir:             http.FS(staticDir),
+		indexTemplate:         tmpl,
+		indexSettings:         string(settings),
+		metadataLoader:        metadataLoader,
+		mappingsStorage:       mappingsStorage,
+		mappingsTracker:       mappingsTracker,
+		ch:                    chV2,
+		duck:                  newDuckShards(cfg, metadataClient.Client),
 		metricsStorage:        metricStorage,
 		selectSettings:        cfg.BuildSelectSettings(),
 		blockedMetricPrefixes: cfg.BlockedMetricPrefixes,
@@ -739,10 +727,13 @@ func (h *Handler) disabledCHAddrs() []string {
 	return h.DisableCHAddr
 }
 
-func (h *Handler) getSelectSettings() string {
+func (h *Handler) sqlDialect() sqlDialect {
+	if h.duck != nil {
+		return sqlDialect{duck: true}
+	}
 	h.ConfigMu.RLock()
 	defer h.ConfigMu.RUnlock()
-	return h.selectSettings
+	return sqlDialect{settings: h.selectSettings}
 }
 
 func (h *requestHandler) savePanic(requestURI string, err any, stack []byte) {
@@ -794,7 +785,21 @@ func (h *Handler) invalidateCache(ctx context.Context, from int64, seen map[cach
 	if from > uncertain {
 		from = uncertain
 	}
+	var sb strings.Builder
+	sb.WriteString("SELECT toInt64(time) AS time, toInt64(tag1) AS key1 FROM ")
+	sb.WriteString(_1sTableSH3)
+	sb.WriteString(" WHERE metric=")
+	sb.WriteString(fmt.Sprint(format.BuiltinMetricIDContributorsLog))
+	sb.WriteString(" AND time>=")
+	sb.WriteString(fmt.Sprint(from))
+	sb.WriteString(" GROUP BY time,key1 LIMIT ")
+	sb.WriteString(fmt.Sprint(cacheInvalidateMaxRows))
+	// TODO - write metric with len(rows)
+	// TODO - code that works if we hit limit above
+
 	var (
+		time    proto.ColInt64
+		key1    proto.ColInt64
 		todo    = map[int64][]int64{}
 		newSeen = map[cacheInvalidateLogRow]struct{}{}
 		req     = requestHandler{
@@ -805,47 +810,42 @@ func (h *Handler) invalidateCache(ctx context.Context, from int64, seen map[cach
 				metric:     "-61", // format.BuiltinMetricIDContributorsLog
 			},
 		}
-		// a tag-only series query through the read seam: empty what (timestamps
-		// and grouped tags only), group by tag1, metric -61. The series query
-		// shape replaces the poll's hand-written SQL, so every backend serves
-		// cache invalidation the same way it serves plots.
-		// TODO - write metric with len(rows)
-		q = seriesDataQuery{
-			user:   "cache-update",
-			metric: format.BuiltinMetricMetaContributorsLog,
-			by:     []int{1},
-		}
-		lod = data_model.LOD{
-			FromSec: from,
-			// the pre-seam poll left the upper time bound open; the seam's LOD
-			// needs one, so look a day past now — contributors-log rows are
-			// written at current seconds and never lag that far
-			ToSec:    timeNow.Add(cacheInvalidateLookAhead).Unix(),
-			StepSec:  _1s,
-			Version:  Version6,
-			Metric:   format.BuiltinMetricMetaContributorsLog,
-			Location: h.location,
-		}
 	)
-	err := req.querySource().querySeries(ctx, &req, &q, lod, func(row tsSelectRow) error {
-		r := cacheInvalidateLogRow{
-			T:  row.time,
-			At: row.tag[1],
-		}
-		newSeen[r] = struct{}{}
-		from = r.T
-		if _, ok := seen[r]; ok {
-			return nil
-		}
-		for lodLevel := range data_model.LODTables[Version6] {
-			t := r.At
-			w := todo[lodLevel]
-			if len(w) == 0 || w[len(w)-1] != t {
-				todo[lodLevel] = append(w, t)
+	err := req.doSelect(ctx, chutil.QueryMetaInto{
+		IsFast:         true,
+		IsLight:        true,
+		User:           "cache-update",
+		Metric:         format.BuiltinMetricMetaContributorsLog,
+		Sharded:        format.BuiltinMetricMetaContributorsLog.Sharded(),
+		DisableCHAddrs: h.disabledCHAddrs(),
+		Table:          _1sTableSH3,
+	}, ch.Query{
+		Body: sb.String(),
+		Result: proto.Results{
+			{Name: "time", Data: &time},
+			{Name: "key1", Data: &key1},
+		},
+		OnResult: func(_ context.Context, b proto.Block) error {
+			for i := 0; i < b.Rows; i++ {
+				r := cacheInvalidateLogRow{
+					T:  time[i],
+					At: key1[i],
+				}
+				newSeen[r] = struct{}{}
+				from = r.T
+				if _, ok := seen[r]; ok {
+					continue
+				}
+				for lodLevel := range data_model.LODTables[Version6] {
+					t := r.At
+					w := todo[lodLevel]
+					if len(w) == 0 || w[len(w)-1] != t {
+						todo[lodLevel] = append(w, t)
+					}
+				}
 			}
-		}
-		return nil
-	})
+			return nil
+		}})
 	if err != nil {
 		log.Printf("[error] cache invalidation log query failed: %v", err)
 		req.endpointStat.report(httpCode(err), format.BuiltinMetricMetaAPIServiceTime.Name)
@@ -863,35 +863,33 @@ func (h *Handler) invalidateCache(ctx context.Context, from int64, seen map[cach
 	return from, newSeen
 }
 
-// blockedQueryError applies the blocked-metric-prefix and blocked-user policy
-// to one query, returning the bad-request refusal the policy maps to, or nil
-// when the query is allowed. The ClickHouse path runs it in doSelect; the
-// duck path runs it before fanning a query out — both over the same pair the
-// ClickHouse query metadata carried (the addressed metric's name and the
-// requesting user), so the two backends refuse the same queries.
-func (h *requestHandler) blockedQueryError(metricName, user string) error {
-	h.Handler.ConfigMu.RLock()
-	defer h.Handler.ConfigMu.RUnlock()
-	for _, prefix := range h.blockedMetricPrefixes {
-		if strings.HasPrefix(metricName, prefix) {
-			return httpErr(http.StatusBadRequest, fmt.Errorf("metric %q is blocked", metricName))
-		}
-	}
-	if slices.Contains(h.blockedUsers, user) {
-		return httpErr(http.StatusBadRequest, fmt.Errorf("user %q is blocked", user))
-	}
-	return nil
-}
-
 func (h *requestHandler) doSelect(ctx context.Context, meta chutil.QueryMetaInto, query ch.Query) error {
-	if err := h.blockedQueryError(meta.Metric.Name, meta.User); err != nil {
+	err := func() error {
+		h.Handler.ConfigMu.RLock()
+		defer h.Handler.ConfigMu.RUnlock()
+		for _, prefix := range h.blockedMetricPrefixes {
+			if strings.HasPrefix(meta.Metric.Name, prefix) {
+				return httpErr(http.StatusBadRequest, fmt.Errorf("metric %q is blocked", meta.Metric.Name))
+			}
+		}
+		if slices.Contains(h.blockedUsers, meta.User) {
+			return httpErr(http.StatusBadRequest, fmt.Errorf("user %q is blocked", meta.User))
+		}
+		return nil
+	}()
+	if err != nil {
 		return err
 	}
 
 	h.Tracef("%s", query.Body)
 
 	h.endpointStat.reportQueryKind(meta.IsFast, meta.IsLight, meta.IsHardware)
-	info, err := h.ch.Select(ctx, meta, query)
+	var info chutil.QueryHandleInfo
+	if h.duck != nil {
+		info.QueryDuration, err = h.duck.Select(ctx, query)
+	} else {
+		info, err = h.ch.Select(ctx, meta, query)
+	}
 	h.endpointStat.reportTiming("ch-select", info.QueryDuration)
 	h.endpointStat.reportTiming("wait-lock", info.WaitLockDuration)
 	ChSelectMetricDuration(info.QueryDuration, meta.Metric, meta.User, meta.Table, "", info.Shard, meta.IsFast, meta.IsLight, meta.IsHardware, info.ErrorCode, err)
@@ -2001,8 +1999,7 @@ func (h *requestHandler) handleGetMetricTagValues(ctx context.Context, req getMe
 		return nil, false, err
 	}
 
-	pq := &tagValuesDataQuery{
-		user:        req.ai.user,
+	pq := &queryBuilder{
 		metric:      metricMeta,
 		tag:         *tag,
 		numResults:  numResults,
@@ -2013,14 +2010,31 @@ func (h *requestHandler) handleGetMetricTagValues(ctx context.Context, req getMe
 	valueCount := map[string]float64{}
 	valueIDCount := map[int64]float64{}
 	for _, lod := range lods {
-		err = h.querySource().queryTagValues(ctx, h, pq, lod, func(tag selectRow) error {
-			if tag.valID != 0 {
-				valueIDCount[int64(tag.valID)] += tag.cnt
-			} else {
-				valueCount[tag.val] += tag.cnt
-			}
-			return nil
-		})
+		query := pq.buildTagValuesQuery(lod, h.sqlDialect())
+		isFast := lod.FromSec+fastQueryTimeInterval >= lod.ToSec
+		sharded := pq.metric.Sharded()
+		err = h.doSelect(ctx, chutil.QueryMetaInto{
+			IsFast:         isFast,
+			IsLight:        true,
+			User:           req.ai.user,
+			Metric:         metricMeta,
+			Table:          lod.Table(sharded),
+			Sharded:        sharded,
+			DisableCHAddrs: h.disabledCHAddrs(),
+		}, ch.Query{
+			Body:   query.body,
+			Result: query.res,
+			OnResult: func(_ context.Context, b proto.Block) error {
+				for i := 0; i < b.Rows; i++ {
+					tag := query.rowAt(i)
+					if tag.valID != 0 {
+						valueIDCount[int64(tag.valID)] += tag.cnt
+					} else {
+						valueCount[tag.val] += tag.cnt
+					}
+				}
+				return nil
+			}})
 		if err != nil {
 			return nil, false, err
 		}
@@ -2973,12 +2987,7 @@ func (c *seriesQuery) rowAt(i int) tsSelectRow {
 func (c *seriesQuery) rowAtPoint(i int) pSelectRow {
 	var row pSelectRow
 	c.valuesAt(i, &row.tsValues)
-	for j := range c.tag {
-		// writeSelectInt registers a mapped tag column as Int32 and only an
-		// aliased expression as Int64; rowAt has always guarded both. Reading
-		// dataInt64 unguarded panicked the api (index out of range on the nil
-		// slice) on any /api/point query grouping by a mapped tag — a path
-		// nothing exercised until the e2e conformance suite issued one.
+	for j := range c.tag { // like rowAt: mapped tag columns are Int32, raw64 expressions Int64
 		if c.tag[j].dataInt32 != nil {
 			row.tag[c.tag[j].tagX] = int64(c.tag[j].dataInt32[i])
 		} else {
@@ -2998,9 +3007,6 @@ func (c *seriesQuery) rowAtPoint(i int) pSelectRow {
 	if len(c.maxHostV2) != 0 {
 		row.maxHost = c.maxHostV2[i]
 	}
-	// The shard column decodes into the row identity the same way rowAt
-	// fills it: without it every shard of a group-by-__shard__ point query
-	// collapses onto shard 0 and the per-shard rows overwrite each other.
 	if c.shardNum != nil {
 		row.shardNum = c.shardNum[i]
 	}
@@ -3079,6 +3085,10 @@ func replaceInfNan(v *float64) {
 }
 
 func loadPoints(ctx context.Context, h *requestHandler, pq *queryBuilder, lod data_model.LOD, ret [][]tsSelectRow, retStartIx int) (int, error) {
+	query, err := pq.buildSeriesQuery(lod, h.sqlDialect())
+	if err != nil {
+		return 0, err
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cc := cache2FromInflightCtx(ctx)
@@ -3091,43 +3101,64 @@ func loadPoints(ctx context.Context, h *requestHandler, pq *queryBuilder, lod da
 		}()
 	}
 	rows := 0
-	// inflight size accounting: the pre-seam code sampled one row per result
-	// block; the seam streams decoded rows, so accumulate per-row sizes and
-	// flush in batches of comparable granularity
-	var inflightBytes int64
+	isFast := lod.IsFast()
+	isLight := query.isLight()
+	isHardware := query.isHardware()
+	sharded := pq.metric.Sharded()
+	table := lod.Table(sharded)
 	start := time.Now()
-	err := h.querySource().querySeries(ctx, h, seriesQueryFromBuilder(pq), lod, func(row tsSelectRow) error {
-		ix, err := lod.IndexOf(row.time)
-		if err != nil {
-			return err
-		}
-		ix += retStartIx
-		ret[ix] = append(ret[ix], row)
-		rows++
-		if cc != nil {
-			inflightBytes += int64(sizeofCache2Row(&row))
-			if rows%cache2InflightApproxRows == 0 {
-				cc.updateInflightApprox(reqID, inflightBytes)
-				inflightBytes = 0
+	err = h.doSelect(ctx, chutil.QueryMetaInto{
+		IsFast:         isFast,
+		IsLight:        isLight,
+		IsHardware:     isHardware,
+		User:           pq.user,
+		Metric:         pq.metric,
+		Table:          table,
+		Sharded:        sharded,
+		DisableCHAddrs: h.disabledCHAddrs(),
+	}, ch.Query{
+		Body:   query.body,
+		Result: query.res,
+		OnResult: func(_ context.Context, block proto.Block) error {
+			select {
+			case <-ctx.Done():
+				return nil // no client. Clickhouse still process query. Just ignore it
+			default:
 			}
-		}
-		return nil
-	})
+			if cc != nil && block.Rows > 0 {
+				r0 := query.rowAt(0)
+				dRows := block.Rows
+				dBytes := sizeofCache2Row(&r0) * dRows
+				cc.updateInflightApprox(reqID, int64(dBytes))
+			}
+			for i := 0; i < block.Rows; i++ {
+				row := query.rowAt(i)
+				ix, err := lod.IndexOf(row.time)
+				if err != nil {
+					return err
+				}
+				ix += retStartIx
+				ret[ix] = append(ret[ix], row)
+			}
+			rows += block.Rows
+			return nil
+		}})
 	duration := time.Since(start)
-	if cc != nil && inflightBytes != 0 {
-		cc.updateInflightApprox(reqID, inflightBytes)
-	}
+	h.reportQueryDuration(query.body, duration)
 	if err != nil {
 		return 0, err
 	}
 
+	for ix := retStartIx; ix < len(ret); ix++ {
+		ret[ix] = mergeShardRows(h, ret[ix])
+	}
 	if rows == maxSeriesRows {
 		return rows, errTooManyRows // prevent cache being populated by incomplete data
 	}
 	if h.verbose {
 		log.Printf("[debug] loaded %v rows from %v (%v timestamps, %v to %v step %v) for %q in %v",
 			rows,
-			lod.Table(pq.metric.Sharded()),
+			table,
 			(lod.ToSec-lod.FromSec)/lod.StepSec,
 			time.Unix(lod.FromSec, 0),
 			time.Unix(lod.ToSec, 0),
@@ -3141,24 +3172,49 @@ func loadPoints(ctx context.Context, h *requestHandler, pq *queryBuilder, lod da
 }
 
 func loadPoint(ctx context.Context, h *requestHandler, pq *queryBuilder, lod data_model.LOD) ([]pSelectRow, error) {
+	query, err := pq.buildSeriesQuery(lod, h.sqlDialect())
+	if err != nil {
+		return nil, err
+	}
 	ret := make([]pSelectRow, 0)
 	rows := 0
-	err := h.querySource().querySeries(ctx, h, seriesQueryFromBuilder(pq), lod, func(row tsSelectRow) error {
-		ret = append(ret, pSelectRow{tsTags: row.tsTags, tsValues: row.tsValues})
-		rows++
-		return nil
-	})
+	isFast := lod.IsFast()
+	isLight := query.isLight()
+	isHardware := query.isHardware()
+	sharded := pq.metric.Sharded()
+	table := lod.Table(sharded)
+	err = h.doSelect(ctx, chutil.QueryMetaInto{
+		IsFast:         isFast,
+		IsLight:        isLight,
+		IsHardware:     isHardware,
+		User:           pq.user,
+		Metric:         pq.metric,
+		Table:          table,
+		Sharded:        sharded,
+		DisableCHAddrs: h.disabledCHAddrs(),
+	}, ch.Query{
+		Body:   query.body,
+		Result: query.res,
+		OnResult: func(_ context.Context, block proto.Block) error {
+			for i := 0; i < block.Rows; i++ {
+				row := query.rowAtPoint(i)
+				ret = append(ret, row)
+			}
+			rows += block.Rows
+			return nil
+		}})
 	if err != nil {
 		return nil, err
 	}
 
+	ret = mergeShardRows(h, ret)
 	if rows == maxSeriesRows {
 		return ret, errTooManyRows // prevent cache being populated by incomplete data
 	}
 	if h.verbose {
 		log.Printf("[debug] loaded %v rows from %v (%v to %v) for %q in",
 			rows,
-			lod.Table(pq.metric.Sharded()),
+			table,
 			time.Unix(lod.FromSec, 0),
 			time.Unix(lod.ToSec, 0),
 			pq.user,

@@ -51,7 +51,7 @@ func TestLoadPointsQueryV6_1h(t *testing.T) {
 	lod := getLodForV6(t, 100_000, 2_000_000, 2_000_000, 3)
 
 	// execute
-	query, err := pq.buildSeriesQuery(lod, " SETTINGS optimize_aggregation_in_order=1")
+	query, err := pq.buildSeriesQuery(lod, sqlDialect{settings: " SETTINGS optimize_aggregation_in_order=1"})
 
 	// checks
 	assert.NoError(t, err)
@@ -79,7 +79,7 @@ func TestLoadPointsQueryV6_1m(t *testing.T) {
 	lod := getLodForV6(t, 10_000, 20_000, 20_000, 3)
 
 	// execute
-	query, err := pq.buildSeriesQuery(lod, " SETTINGS optimize_aggregation_in_order=1")
+	query, err := pq.buildSeriesQuery(lod, sqlDialect{settings: " SETTINGS optimize_aggregation_in_order=1"})
 
 	// checks
 	assert.NoError(t, err)
@@ -107,7 +107,7 @@ func TestLoadPointsQueryV6_1s(t *testing.T) {
 	lod := getLodForV6(t, 10001, 10030, 10030, 0)
 
 	// execute
-	query, err := pq.buildSeriesQuery(lod, " SETTINGS optimize_aggregation_in_order=1")
+	query, err := pq.buildSeriesQuery(lod, sqlDialect{settings: " SETTINGS optimize_aggregation_in_order=1"})
 
 	// checks
 	assert.NoError(t, err)

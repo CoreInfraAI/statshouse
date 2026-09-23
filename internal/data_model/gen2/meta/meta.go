@@ -388,24 +388,10 @@ func init() {
 		&metainternal.TLItemImpl{Name: "statshouse.shutdownInfo", Tag: 0x4124cf9c, HaTL1: true})
 	metainternal.FillObject(
 		&metainternal.TLItemImpl{Name: "statshouse.sourceBucket3", Tag: 0x16c4dd7b, HaTL1: true})
-	metainternal.FillObject(
-		&metainternal.TLItemImpl{Name: "statshouse.storeLod", Tag: 0x57cb1003, HaTL1: true})
-	metainternal.FillObject(
-		&metainternal.TLItemImpl{Name: "statshouse.storeQueryBase", Tag: 0x57cb1004, HaTL1: true})
 	metainternal.FillFunction(
-		&metainternal.TLItemImpl{Name: "statshouse.storeQuerySeries", Tag: 0x57cb1008, HaTL1: true, Annotations: 0x8})
-	metainternal.FillFunction(
-		&metainternal.TLItemImpl{Name: "statshouse.storeQueryTagValues", Tag: 0x57cb1009, HaTL1: true, Annotations: 0x8})
+		&metainternal.TLItemImpl{Name: "statshouse.storeQuery", Tag: 0x57cb1011, HaTL1: true, Annotations: 0x8})
 	metainternal.FillObject(
-		&metainternal.TLItemImpl{Name: "statshouse.storeSeriesBatch", Tag: 0x57cb1005, HaTL1: true})
-	metainternal.FillObject(
-		&metainternal.TLItemImpl{Name: "statshouse.storeSeriesResponse", Tag: 0x57cb1006, HaTL1: true})
-	metainternal.FillObject(
-		&metainternal.TLItemImpl{Name: "statshouse.storeTagFilter", Tag: 0x57cb1001, HaTL1: true})
-	metainternal.FillObject(
-		&metainternal.TLItemImpl{Name: "statshouse.storeTagLayout", Tag: 0x57cb1002, HaTL1: true})
-	metainternal.FillObject(
-		&metainternal.TLItemImpl{Name: "statshouse.storeTagValuesResponse", Tag: 0x57cb1007, HaTL1: true})
+		&metainternal.TLItemImpl{Name: "statshouse.storeQueryResponse", Tag: 0x57cb1010, HaTL1: true})
 	metainternal.FillFunction(
 		&metainternal.TLItemImpl{Name: "statshouse.testConnection2", Tag: 0x4285ff58, HaTL1: true, Annotations: 0x10})
 	metainternal.FillObject(

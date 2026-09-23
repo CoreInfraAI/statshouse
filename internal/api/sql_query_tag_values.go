@@ -10,15 +10,16 @@ import (
 	"github.com/VKCOM/statshouse/internal/format"
 )
 
-func (b *queryBuilder) buildTagValuesQuery(lod data_model.LOD, settings string) *tagValuesQuery {
-	return b.buildTagValuesQueryEx(lod, settings, buildTagValuesQuery)
+func (b *queryBuilder) buildTagValuesQuery(lod data_model.LOD, dialect sqlDialect) *tagValuesQuery {
+	return b.buildTagValuesQueryEx(lod, dialect, buildTagValuesQuery)
 }
 
-func (b *queryBuilder) buildTagValueIDsQuery(lod data_model.LOD, settings string) *tagValuesQuery {
-	return b.buildTagValuesQueryEx(lod, settings, buildTagValueIDsQuery)
+func (b *queryBuilder) buildTagValueIDsQuery(lod data_model.LOD, dialect sqlDialect) *tagValuesQuery {
+	return b.buildTagValuesQueryEx(lod, dialect, buildTagValueIDsQuery)
 }
 
-func (b *queryBuilder) buildTagValuesQueryEx(lod data_model.LOD, settings string, mode queryBuilderMode) *tagValuesQuery {
+func (b *queryBuilder) buildTagValuesQueryEx(lod data_model.LOD, dialect sqlDialect, mode queryBuilderMode) *tagValuesQuery {
+	b.duck = dialect.duck
 	if b.tag.Index == format.StringTopTagIndex {
 		b.tag.Index = format.StringTopTagIndexV3
 	}
@@ -32,7 +33,7 @@ func (b *queryBuilder) buildTagValuesQueryEx(lod data_model.LOD, settings string
 	q.writeGroupBy(&sb, &lod, mode)
 	sb.WriteString(" HAVING _count>0")
 	q.writeOrderBy(&sb, &lod, mode)
-	sb.WriteString(settings)
+	sb.WriteString(dialect.settings)
 	q.body = sb.String()
 	return &q
 }

@@ -61,6 +61,34 @@ func (a *Aggregator) handleClient(ctx context.Context, hctx *rpc.HandlerContext)
 	return err
 }
 
+// handleWorker serves what handleClient leaves to worker goroutines: duck-store
+// queries, which block for as long as DuckDB runs them.
+func (a *Aggregator) handleWorker(ctx context.Context, hctx *rpc.HandlerContext) error {
+	h := tlstatshouse.Handler{StoreQuery: a.handleStoreQuery}
+	return h.Handle(ctx, hctx)
+}
+
+func (a *Aggregator) handleStoreQuery(ctx context.Context, args tlstatshouse.StoreQuery) (tlstatshouse.StoreQueryResponse, error) {
+	if a.duck == nil {
+		return tlstatshouse.StoreQueryResponse{}, fmt.Errorf("aggregator does not run --storage-backend=duck")
+	}
+	timeout := time.Minute // the server disables request timeouts, the client passes its own
+	if hctx := rpc.GetHandlerContext(ctx); hctx != nil && hctx.RequestExtra.CustomTimeoutMs > 0 {
+		timeout = time.Duration(hctx.RequestExtra.CustomTimeoutMs) * time.Millisecond
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	rows, cols, err := a.duck.Query(ctx, args.Sql)
+	if err != nil {
+		return tlstatshouse.StoreQueryResponse{}, err
+	}
+	resp := tlstatshouse.StoreQueryResponse{Rows: int32(rows), Columns: make([]string, len(cols))}
+	for i, c := range cols {
+		resp.Columns[i] = string(c)
+	}
+	return resp, nil
+}
+
 func (a *Aggregator) getConfigResult3Locked() tlstatshouse.GetConfigResult3 {
 	return tlstatshouse.GetConfigResult3{
 		Addresses:          a.configR.ClusterShardsAddrs,

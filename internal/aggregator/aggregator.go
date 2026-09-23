@@ -111,16 +111,7 @@ type (
 
 		config ConfigAggregator
 
-		// duckStore is non-nil exactly when the duck storage backend is
-		// selected: the handle on the shard's duck-store, shared by all insert
-		// threads (see duckStoreHandle). ClickHouse remains the default.
-		duckStore duckStoreHandle
-
-		// queryServer is the store-query listener, non-nil when the duck
-		// backend is selected and a query address is configured: the second
-		// RPC endpoint, bounded and admission-controlled, that the API reads
-		// the shard through.
-		queryServer *storeQueryServer
+		duck *duckstore.Store // non-nil with --storage-backend=duck: metric data goes there instead of ClickHouse
 
 		// Remote config
 		configR     ConfigAggregatorRemote
@@ -203,13 +194,8 @@ func MakeAggregator(fj *os.File, fjCompact *os.File, mappingsCache *pcache.Mappi
 		if config.ExternalPort == "" {
 			config.ExternalPort = listenPort
 		}
-		if config.StorageBackend == duckstore.BackendDuck {
-			// No ClickHouse cluster to autodetect from (validation refuses
-			// --kh under duck): the local flags name the shard and replica
-			// this process owns. ValidateConfigAggregator already checked
-			// their ranges; MakeAggregator callers that bypass validation
-			// still get sane keys, not the 1/1 demo default.
-			shardKey, replicaKey = int32(config.LocalShard), int32(config.LocalReplica)
+		if config.StorageBackend == duckstore.BackendDuck { // no ClickHouse cluster to detect them from
+			shardKey, replicaKey = int32(config.LocalShard), int32(max(config.LocalReplica, 1))
 		} else if config.KHAddr != "" {
 			shardKey, replicaKey, localAddresses, err = selectShardReplica(config.KHAddr, config.KHUser, config.KHPassword, config.Cluster, config.ExternalPort)
 			if err != nil {
@@ -327,6 +313,7 @@ func MakeAggregator(fj *os.File, fjCompact *os.File, mappingsCache *pcache.Mappi
 		rpc.ServerWithLogf(log.Printf),
 		rpc.ServerWithMaxWorkers(-1),
 		rpc.ServerWithSyncHandler(a.handleClient),
+		rpc.ServerWithHandler(a.handleWorker), // store queries block, so they run on workers
 		rpc.ServerWithDisableContextTimeout(true),
 		rpc.ServerWithTrustedSubnetGroups(trustedSubnetGroups),
 		rpc.ServerWithVersion(build.Info()),
@@ -401,34 +388,20 @@ func MakeAggregator(fj *os.File, fjCompact *os.File, mappingsCache *pcache.Mappi
 	_ = a.advanceRecentBuckets(now, true) // Just create initial set of buckets and set LastHour
 	a.appendInternalLog("start", "", build.Commit(), build.Info(), strings.Join(os.Args[1:], " "), strings.Join(a.config.RemoteInitial.ClusterShardsAddrs, ","), "", "Started")
 
-	// The duck store must exist before the insert threads start; from here to
-	// the end of MakeAggregator nothing fails anymore.
-	var queryLn net.Listener
 	if a.config.StorageBackend == duckstore.BackendDuck {
-		duck, err := openDuckStore(a.config, a.sh2)
+		a.duck, err = duckstore.Open(duckstore.Config{
+			Dir:              a.config.DuckStoreDir,
+			ShardNum:         int(a.shardKey),
+			Retention1s:      a.config.DuckRetention1s,
+			Retention1m:      a.config.DuckRetention1m,
+			Retention1h:      a.config.DuckRetention1h,
+			MemoryLimitBytes: a.config.DuckMemoryLimit,
+			QueryConcurrency: a.config.DuckQueryConcurrency,
+			Metrics:          sh2,
+			Logf:             log.Printf,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to open duck-store in %q: %v", a.config.DuckStoreDir, err)
-		}
-		a.duckStore = duck
-		// Query traffic gets its own listener with its own, bounded settings —
-		// the ingest listener's unlimited workers and absent timeouts are for
-		// trusted contributors, not for the API's queries.
-		if a.config.DuckQueryAddr != "" {
-			a.queryServer = newStoreQueryServer(storeQueryServerConfig{
-				Address:     a.config.DuckQueryAddr,
-				Concurrency: a.config.DuckQueryConcurrency,
-				Metrics:     duck.QueryMetrics(),
-				CryptoKeys:  []string{aesPwd},
-				Logf:        log.Printf,
-			}, duck.QueryExecutor(a.metricStorage, a.shardKey))
-			// Bind here, synchronously: under duck this listener is the
-			// shard's entire read path, so an address that cannot bind is a
-			// startup failure — a silently write-only shard is exactly the
-			// misconfiguration the duck validation exists to make loud.
-			queryLn, err = rpc.Listen("tcp4", a.config.DuckQueryAddr, false)
-			if err != nil {
-				return nil, fmt.Errorf("failed to bind duck query listener on %q: %v", a.config.DuckQueryAddr, err)
-			}
 		}
 	}
 
@@ -449,14 +422,6 @@ func MakeAggregator(fj *os.File, fjCompact *os.File, mappingsCache *pcache.Mappi
 	go func() { // before sh2.Run because agent will also connect to local aggregator
 		_ = a.server.ListenAndServe("tcp4", listenAddr)
 	}()
-
-	if a.queryServer != nil {
-		go func() {
-			if err := a.queryServer.Serve(queryLn); err != nil {
-				log.Printf("[error] duck query listener stopped: %v", err)
-			}
-		}()
-	}
 
 	sh2.Run(a.aggregatorHostTag.I, a.shardKey, a.replicaKey)
 
@@ -494,22 +459,18 @@ func (a *Aggregator) SaveJournals() {
 	_, _, _ = a.journalCompact.Save()
 }
 
-func (a *Aggregator) SaveMappings() {
-	if _, err := a.mappingsStorage.Save(); err != nil {
-		log.Printf("Mappings storage save failed: %v", err)
+// CloseDuckStore closes the duck-store, if any, once nothing writes to it anymore.
+func (a *Aggregator) CloseDuckStore() {
+	if a.duck != nil {
+		if err := a.duck.Close(); err != nil {
+			log.Printf("duck store close failed: %v", err)
+		}
 	}
 }
 
-// CloseDuckStore stops the duck store's maintenance loops and releases its
-// DuckDB handles — the last shutdown step under the duck backend, after every
-// producer of store writes (insert threads, RPC servers) has stopped. Under
-// ClickHouse it is a no-op.
-func (a *Aggregator) CloseDuckStore() {
-	if a.duckStore == nil {
-		return
-	}
-	if err := a.duckStore.Close(); err != nil {
-		log.Printf("duck store close failed: %v", err)
+func (a *Aggregator) SaveMappings() {
+	if _, err := a.mappingsStorage.Save(); err != nil {
+		log.Printf("Mappings storage save failed: %v", err)
 	}
 }
 
@@ -537,9 +498,6 @@ func (a *Aggregator) WaitInsertsFinish(timeout time.Duration) {
 
 func (a *Aggregator) ShutdownRPCServer() {
 	a.server.Shutdown()
-	if a.queryServer != nil {
-		a.queryServer.Shutdown()
-	}
 }
 
 func (a *Aggregator) WaitRPCServer(timeout time.Duration) {
@@ -547,11 +505,6 @@ func (a *Aggregator) WaitRPCServer(timeout time.Duration) {
 	defer cancel()
 	if err := a.server.CloseWait(ctx); err != nil {
 		log.Printf("WaitRPCServer timeout after %v: %v", timeout, err)
-	}
-	if a.queryServer != nil {
-		if err := a.queryServer.CloseWait(ctx); err != nil {
-			log.Printf("query server CloseWait timeout after %v: %v", timeout, err)
-		}
 	}
 }
 
@@ -797,14 +750,14 @@ func (a *Aggregator) goInsert(insertsSema *semaphore.Weighted, cancelCtx context
 
 	rnd := rand.New()
 	httpClient := makeHTTPClient()
-	sink := a.newInsertSink(httpClient)
 	var buffers data_model.SamplerBuffers
 	var aggBuckets []*aggregatorBucket
+	var bodyStorage []byte
 	var hostBudgets = map[data_model.TagUnion][]tlstatshouse.MetricBudget{}
 
 	for aggBucket := range bucketsToSend {
 		aggBuckets = aggBuckets[:0]
-		sink.Reset()
+		bodyStorage = bodyStorage[:0]
 		for host := range hostBudgets {
 			hostBudgets[host] = hostBudgets[host][:0]
 		}
@@ -901,11 +854,22 @@ func (a *Aggregator) goInsert(insertsSema *semaphore.Weighted, cancelCtx context
 
 		var marshalDur time.Duration
 		var stats insertStats
-		buffers, stats, marshalDur = a.rowDataMarshalAppendPositions(aggBuckets, buffers, rnd, sink, nowUnix)
+		bodyStorage, buffers, stats, marshalDur = a.rowDataMarshalAppendPositions(aggBuckets, buffers, rnd, bodyStorage[:0])
 
 		// Never empty, because adds value stats
 		ctx, cancelSendToCh := context.WithTimeout(cancelCtx, data_model.ClickHouseTimeoutInsert)
-		status, exception, dur, sendErr := sink.Send(ctx)
+		var status, exception int
+		var dur time.Duration
+		var sendErr error
+		if a.duck != nil {
+			start := time.Now()
+			if sendErr = a.duck.Insert(ctx, bodyStorage); sendErr == nil {
+				status = http.StatusOK
+			}
+			dur = time.Since(start)
+		} else {
+			status, exception, dur, sendErr = sendToClickhouse(ctx, httpClient, a.config.KHAddr, a.config.KHUser, a.config.KHPassword, getTableDesc(), bodyStorage, configR.V3InsertSettings)
+		}
 		cancelSendToCh()
 		func() {
 			a.migrationMu.Lock()
@@ -989,7 +953,7 @@ func (a *Aggregator) goInsert(insertsSema *semaphore.Weighted, cancelCtx context
 			a.reportInsertMetric(b.time, format.BuiltinMetricMetaAggInsertTime, i != 0, sendErr, status, exception, 0, dur.Seconds())
 		}
 		// insert of all buckets is also accounted into single event at aggBucket.time second, so the graphic will be smoother
-		a.reportInsertMetric(aggBucket.time, format.BuiltinMetricMetaAggInsertSizeReal, willInsertHistoric, sendErr, status, exception, 0, float64(sink.RoundSize()))
+		a.reportInsertMetric(aggBucket.time, format.BuiltinMetricMetaAggInsertSizeReal, willInsertHistoric, sendErr, status, exception, 0, float64(len(bodyStorage)))
 		a.reportInsertMetric(aggBucket.time, format.BuiltinMetricMetaAggInsertTimeReal, willInsertHistoric, sendErr, status, exception, 0, dur.Seconds())
 		a.reportInsertMetric(aggBucket.time, format.BuiltinMetricMetaAggSamplingTime, willInsertHistoric, sendErr, status, exception, 0, marshalDur.Seconds())
 		tableTag := int32(format.TagValueIDAggInsertV3)

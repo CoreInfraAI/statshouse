@@ -18,42 +18,30 @@ tracker, triage labels, domain docs) and [CONTEXT.md](./CONTEXT.md).
 
 ## The storage-backend seam
 
-Metric data storage is behind exactly two seams; ClickHouse and duck-store
-(DuckDB embedded in the aggregator) are the two implementations, selected per
-process by `--storage-backend=clickhouse|duck` (parsed by
-`duckstore.StorageBackend`). One backend per process — no dual-write, no
-read-comparison mode.
+Metric data lives in ClickHouse or in duck-store (DuckDB embedded in the
+aggregator), selected per process by `--storage-backend=clickhouse|duck`
+(parsed by `duckstore.StorageBackend`). One backend per process — no
+dual-write, no read-comparison mode. The seam is deliberately thin:
 
-- **Write seam — `InsertSink`** (`internal/aggregator`): receives the sampled
-  in-memory row set plus a `Send(ctx)` returning status/exception/elapsed, so
-  insert budgeting, sampling and ingestion-status machinery are shared and
-  untouched. ClickHouse sink: `aggregator_insert.go` (RowBinary bytes);
-  duck sink: `internal/duckstore/writer.go` — the delta is single-tier: the
-  writer appends only `rows_1s`, and compaction derives the 1m/1h tiers by
-  timestamp truncation.
-- **Read seam — `QuerySource`** (`internal/api/query_source.go`): series and
-  tag-values methods taking a semantic request plus an LOD. ClickHouse:
-  `query_source_ch.go` (today's SQL builder through `doSelect`). Duck:
-  `query_source_duck.go` + `fanout.go` — the request is serialized over the
-  structured store-query RPC to every relevant aggregator shard
-  (`internal/aggregator/store_query_server.go`) and merged in Go through the
-  existing cross-LOD state merge. Inside duckstore the read runs over a
-  query-source snapshot (`internal/duckstore/query_snapshot.go`):
-  per-source descriptors carrying each file's kind, tier table and exact
-  time range — the active delta, rolled-but-unconsumed generations and
-  archive windows — so a concurrent roll or consume can neither lose nor
-  double-count a generation.
+- **Writes**: `goInsert` builds the same RowBinary body for both backends and
+  branches only at the send — ClickHouse over HTTP, duck into
+  `duckstore.Store.Insert`, which decodes the body and appends every row to
+  the three tier tables in one transaction. Compaction collapses closed time
+  buckets in place; DuckDB's MVCC is the only concurrency mechanism.
+- **Reads**: the API renders SQL with its ClickHouse query builder in a duck
+  dialect (`sqlDialect`), `requestHandler.doSelect` sends it to every shard
+  over `statshouse.storeQuery` (`internal/api/duck.go`), and the aggregator
+  runs it (`aggregator_handlers.go` → `duckstore.Store.Query`) against views
+  and macros that mimic the ClickHouse tables and functions
+  (`duckstore.compatSQL`). Results come back as ClickHouse Native columns and
+  decode through the ClickHouse path; `mergeShardRows` folds rows of one
+  series from several shards.
 
-Ground rules when touching either seam:
+Ground rules when touching the seam:
 
-- The ClickHouse paths must stay behaviourally identical; the insert refactor
-  is verified byte-identical.
-- duck-store's compaction and sealing transact through the writer's
-  connection-level protocol — explicit `BEGIN`/`COMMIT` via
-  `conn.ExecContext`, never `sql.Tx`, which a live `duckdb.Appender` cannot
-  participate in — so `ConsumeOptions.AppendWindow` carries the `*sql.Conn`
-  and the appended rows plus the consumption record commit, or roll back, as
-  one.
+- The ClickHouse paths must stay behaviourally identical.
+- Transactions that involve a `duckdb.Appender` use explicit `BEGIN`/`COMMIT`
+  on the `*sql.Conn` (`duckstore.inTx`), never `sql.Tx`.
 - The API never links DuckDB — everything crosses the RPC. The aggregator
   gates duck on `duckstore.Available` (false in untagged builds); the API
   accepts `duck` in any build.
@@ -64,10 +52,10 @@ Ground rules when touching either seam:
   the identical deterministic stream to both and compares the two APIs'
   decoded answers to every query shape, with CH as the reference. The e2e
   suite's client assertions and input matrix are frozen. Backend comparisons
-  are always by decoded value — never by generated SQL, state bytes, or file
-  lists. The same suite also runs the duck stack alone (`go run ./e2e
-  --storage-backend=duck`, or `bash e2e/lima.sh --storage-backend=duck`):
-  no ClickHouse container, the same client assertions.
-- The operator-facing surface (flags, retention, disk formula, quarantine,
-  backup policy) is documented in `docs/duck-store.md`, kept in sync with the
-  code by `internal/duckstore/docs_test.go`.
+  are always by decoded value — never by generated SQL or state bytes. The
+  same suite also runs the duck stack alone (`go run ./e2e
+  --storage-backend=duck`): no ClickHouse container, the same client
+  assertions.
+- The operator-facing surface (flags, retention, upgrades, metrics) is
+  documented in `docs/duck-store.md`, kept in sync with the code by
+  `internal/duckstore/docs_test.go`.

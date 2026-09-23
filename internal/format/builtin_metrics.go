@@ -1542,113 +1542,24 @@ var BuiltinMetricMetaAgentAggregatorTimeDiff = &MetricMetaValue{
 	}},
 }
 
-// Tag values of the duck-store observability metrics. The constants are the
-// contract between the metrics' ValueComments and the aggregator code that
-// fills the tags (internal/aggregator), so both sides name the same numbers.
+// Tag values of the duck-store metrics, set by internal/duckstore.
 const (
 	TagValueIDDuckMaintenanceCompaction = 1
-	TagValueIDDuckMaintenanceSealing    = 2
 	TagValueIDDuckMaintenanceRetention  = 3
-)
 
-var duckMaintenanceToValue = map[int32]string{
-	TagValueIDDuckMaintenanceCompaction: "compaction",
-	TagValueIDDuckMaintenanceSealing:    "sealing",
-	TagValueIDDuckMaintenanceRetention:  "retention",
-}
-
-const (
-	TagValueIDDuckWindowSealed        = 1
-	TagValueIDDuckWindowUnlinked      = 2
-	TagValueIDDuckWindowEarlyEvicted  = 3
-	TagValueIDDuckWindowLeaseDeferred = 4
-	TagValueIDDuckWindowLateDropped   = 5
-	TagValueIDDuckWindowRecollapsed   = 6
-)
-
-var duckWindowEventToValue = map[int32]string{
-	TagValueIDDuckWindowSealed:        "sealed",
-	TagValueIDDuckWindowUnlinked:      "unlinked",
-	TagValueIDDuckWindowEarlyEvicted:  "early_evicted",
-	TagValueIDDuckWindowLeaseDeferred: "lease_deferred",
-	TagValueIDDuckWindowLateDropped:   "late_dropped",
-	TagValueIDDuckWindowRecollapsed:   "recollapsed",
-}
-
-const (
 	TagValueIDDuckTier1s = 1
 	TagValueIDDuckTier1m = 2
 	TagValueIDDuckTier1h = 3
-)
 
-var duckTierToValue = map[int32]string{
-	TagValueIDDuckTier1s: "1s",
-	TagValueIDDuckTier1m: "1m",
-	TagValueIDDuckTier1h: "1h",
-}
+	TagValueIDDuckQueryRefused = 4 // beside TagValueIDStatusOK and TagValueIDStatusError
 
-const (
-	TagValueIDDuckQuarantineDeltaSchema   = 1
-	TagValueIDDuckQuarantineArchiveSchema = 2
-	TagValueIDDuckQuarantineStorage       = 3
-	TagValueIDDuckQuarantineStatshouse    = 4
-	TagValueIDDuckQuarantineUnreadable    = 5
-)
-
-var duckQuarantineAxisToValue = map[int32]string{
-	TagValueIDDuckQuarantineDeltaSchema:   "delta_schema",
-	TagValueIDDuckQuarantineArchiveSchema: "archive_schema",
-	TagValueIDDuckQuarantineStorage:       "storage",
-	TagValueIDDuckQuarantineStatshouse:    "statshouse",
-	TagValueIDDuckQuarantineUnreadable:    "unreadable",
-}
-
-const (
-	TagValueIDDuckQuerySeries    = 1
-	TagValueIDDuckQueryTagValues = 2
-)
-
-var duckQueryVerbToValue = map[int32]string{
-	TagValueIDDuckQuerySeries:    "series",
-	TagValueIDDuckQueryTagValues: "tag_values",
-}
-
-// The two admission outcomes the query listener records without executing
-// anything; ok and error (the executions) come from the shared status
-// constants.
-const (
-	TagValueIDDuckQueryQueued  = 3
-	TagValueIDDuckQueryRefused = 4
-)
-
-const (
-	TagValueIDDuckSizeDelta   = 1
-	TagValueIDDuckSizeArchive = 2
-)
-
-var duckSizeLocationToValue = map[int32]string{
-	TagValueIDDuckSizeDelta:   "delta",
-	TagValueIDDuckSizeArchive: "archive",
-}
-
-const (
 	TagValueIDDuckSizeUsed = 1
 	TagValueIDDuckSizeFree = 2
 )
 
-var duckSizeMeasureToValue = map[int32]string{
-	TagValueIDDuckSizeUsed: "used",
-	TagValueIDDuckSizeFree: "free",
-}
-
-const (
-	TagValueIDDuckBacklogGenerations      = 1
-	TagValueIDDuckBacklogOldestAgeSeconds = 2
-)
-
-var duckBacklogMeasureToValue = map[int32]string{
-	TagValueIDDuckBacklogGenerations:      "generations",
-	TagValueIDDuckBacklogOldestAgeSeconds: "oldest_age_seconds",
+var duckMaintenanceToValue = map[int32]string{
+	TagValueIDDuckMaintenanceCompaction: "compaction",
+	TagValueIDDuckMaintenanceRetention:  "retention",
 }
 
 var BuiltinMetricMetaDuckMaintenanceTime = &MetricMetaValue{
@@ -1673,43 +1584,10 @@ Set by aggregator.`,
 	}},
 }
 
-var BuiltinMetricMetaDuckWindows = &MetricMetaValue{
-	Name: "__duck_store_windows",
-	Kind: MetricKindCounter,
-	Description: `Archive windows duck-store maintenance acted on: sealed by the sealer, unlinked by retention, evicted early by the free-space watermark, whose unlink a reader's lease deferred, whose late rows a consume dropped because the window was already sealed, or whose accumulated partial rows the sealer re-collapsed into one ahead of the seal.
-Set by aggregator.`,
-	NoSampleAgent:           true, // generated on aggregators, must be delivered without losses
-	BuiltinAllowedToReceive: false,
-	WithAgentEnvRouteArch:   false,
-	WithAggregatorID:        true,
-	Tags: []MetricMetaTag{{
-		Description:   "event",
-		ValueComments: convertToValueComments(duckWindowEventToValue),
-	}, {
-		Description:   "tier",
-		ValueComments: convertToValueComments(duckTierToValue),
-	}},
-}
-
-var BuiltinMetricMetaDuckQuarantinedFiles = &MetricMetaValue{
-	Name: "__duck_store_quarantined_files",
-	Kind: MetricKindCounter,
-	Description: `Store files the aggregator quarantined on open, by the version axis that excluded them (delta schema, archive schema, DuckDB storage, statshouse version, or unreadable).
-Count is the number of files. Set by aggregator.`,
-	NoSampleAgent:           true, // generated on aggregators, must be delivered without losses
-	BuiltinAllowedToReceive: false,
-	WithAgentEnvRouteArch:   false,
-	WithAggregatorID:        true,
-	Tags: []MetricMetaTag{{
-		Description:   "axis",
-		ValueComments: convertToValueComments(duckQuarantineAxisToValue),
-	}},
-}
-
 var BuiltinMetricMetaDuckQueryTime = &MetricMetaValue{
 	Name: "__duck_store_query_time",
 	Kind: MetricKindValue,
-	Description: `Time one structured store query took, by verb and outcome. ok and error are executions measured by the store; queued is the wait a query endured before being admitted (value = the wait); refused is a query shed at admission (value = how long it waited before the refusal). Count is the query load.
+	Description: `Time one store query took on the aggregator, by outcome; refused is a query that found every query slot busy until its deadline (value = the wait). Count is the query load.
 Set by aggregator.`,
 	MetricType:              MetricSecond,
 	NoSampleAgent:           true, // generated on aggregators, must be delivered without losses
@@ -1717,14 +1595,10 @@ Set by aggregator.`,
 	WithAgentEnvRouteArch:   false,
 	WithAggregatorID:        true,
 	Tags: []MetricMetaTag{{
-		Description:   "verb",
-		ValueComments: convertToValueComments(duckQueryVerbToValue),
-	}, {
 		Description: "status",
 		ValueComments: convertToValueComments(map[int32]string{
 			TagValueIDStatusOK:         "ok",
 			TagValueIDStatusError:      "error",
-			TagValueIDDuckQueryQueued:  "queued",
 			TagValueIDDuckQueryRefused: "refused",
 		}),
 	}},
@@ -1733,7 +1607,7 @@ Set by aggregator.`,
 var BuiltinMetricMetaDuckStoreSize = &MetricMetaValue{
 	Name: "__duck_store_size",
 	Kind: MetricKindValue,
-	Description: `Size of the shard's duck-store measured with DuckDB's database-size pragma — block_size times blocks, which sees the free blocks DuckDB reuses and file length does not — summed over the delta generations and the archive windows.
+	Description: `Size of the shard's duck-store file from DuckDB's database_size pragma: used blocks, and free blocks DuckDB will reuse before growing the file.
 Set by aggregator.`,
 	MetricType:              MetricByte,
 	NoSampleAgent:           true, // generated on aggregators, must be delivered without losses
@@ -1741,33 +1615,37 @@ Set by aggregator.`,
 	WithAgentEnvRouteArch:   false,
 	WithAggregatorID:        true,
 	Tags: []MetricMetaTag{{
-		Description:   "location",
-		ValueComments: convertToValueComments(duckSizeLocationToValue),
-	}, {
-		Description:   "measure",
-		ValueComments: convertToValueComments(duckSizeMeasureToValue),
+		Description: "measure",
+		ValueComments: convertToValueComments(map[int32]string{
+			TagValueIDDuckSizeUsed: "used",
+			TagValueIDDuckSizeFree: "free",
+		}),
 	}},
 }
 
 var BuiltinMetricMetaDuckBacklog = &MetricMetaValue{
 	Name: "__duck_store_backlog",
 	Kind: MetricKindValue,
-	Description: `Ingestion backlog of the shard's duck-store, sampled from in-memory state only, so it keeps flowing while maintenance holds the store's file locks: generations is how many rolled delta generations still hold rows compaction has not taken, oldest_age_seconds is how long the oldest has waited (counted from process start for generations recovered from disk). Count is one per sample.
+	Description: `Time buckets holding uncollapsed rows that compaction has not folded yet, per tier. Sampled from memory; growth means compaction is falling behind ingestion.
 Set by aggregator.`,
 	NoSampleAgent:           true, // generated on aggregators, must be delivered without losses
 	BuiltinAllowedToReceive: false,
 	WithAgentEnvRouteArch:   false,
 	WithAggregatorID:        true,
 	Tags: []MetricMetaTag{{
-		Description:   "measure",
-		ValueComments: convertToValueComments(duckBacklogMeasureToValue),
+		Description: "tier",
+		ValueComments: convertToValueComments(map[int32]string{
+			TagValueIDDuckTier1s: "1s",
+			TagValueIDDuckTier1m: "1m",
+			TagValueIDDuckTier1h: "1h",
+		}),
 	}},
 }
 
 var BuiltinMetricMetaDuckMaintenanceAge = &MetricMetaValue{
 	Name: "__duck_store_maintenance_age",
 	Kind: MetricKindValue,
-	Description: `Seconds since each duck-store background maintenance (compaction, sealing, retention) last completed a successful pass, counted from the component's start until its first success, so a pass that never returns reads as a growing age instead of as no data.
+	Description: `Seconds since each duck-store background maintenance last completed a successful pass (counted from the store's start until the first one), so a stuck pass reads as a growing age instead of as no data.
 Set by aggregator.`,
 	MetricType:              MetricSecond,
 	NoSampleAgent:           true, // generated on aggregators, must be delivered without losses

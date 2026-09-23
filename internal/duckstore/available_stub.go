@@ -8,7 +8,21 @@
 
 package duckstore
 
-// Available reports whether this binary embeds DuckDB. Without the "duckdb"
-// build tag no DuckDB code is compiled in at all, and the duck storage
-// backend is rejected at startup (see StorageBackend.Validate).
+import (
+	"context"
+	"fmt"
+)
+
+// Available reports whether this binary embeds DuckDB (the "duckdb" build tag).
 const Available = false
+
+// Store is a placeholder in binaries built without DuckDB; Open always fails.
+type Store struct{}
+
+func Open(Config) (*Store, error) {
+	return nil, fmt.Errorf("duck-store: this binary was built without the %q build tag", BuildTag)
+}
+
+func (*Store) Insert(context.Context, []byte) error                 { return nil }
+func (*Store) Query(context.Context, string) (int, [][]byte, error) { return 0, nil, nil }
+func (*Store) Close() error                                         { return nil }

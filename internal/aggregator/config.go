@@ -60,48 +60,15 @@ type ConfigAggregator struct {
 	HistoricInserters  int
 	InsertHistoricWhen int
 
-	// StorageBackend selects where the aggregator stores metric data. The
-	// default (clickhouse) is behaviourally identical to the pre-seam
-	// aggregator. Selecting duck requires a binary built with the "duckdb"
-	// build tag; validation rejects it otherwise.
-	StorageBackend duckstore.StorageBackend
-
-	// DuckStoreDir is the directory the duck-store owns when StorageBackend
-	// is duck: delta generations and archive windows are created inside it on
-	// first start. Empty means unset, which openDuckStore rejects.
-	DuckStoreDir string
-
-	// Duck retention, applied per tier by the retainer that unlinks whole
-	// archive window files: how long a tier's windows are kept after the
-	// window they cover has ended. Zero keeps the tier's windows forever. The
-	// defaults mirror ClickHouse's TTLs — 52 h (1s), 33 d (1m), unbounded (1h).
-	DuckRetention1s time.Duration
-	DuckRetention1m time.Duration
-	DuckRetention1h time.Duration
-
-	// DuckFreeSpaceWatermark is the minimum free disk space, in bytes, on the
-	// volume holding the duck store directory; below it the oldest archive
-	// windows are evicted early instead of letting ingestion stop for want of
-	// disk. Zero disables the check.
-	DuckFreeSpaceWatermark int64
-
-	// DuckQueryAddr is the address the store-query listener serves on when
-	// StorageBackend is duck: its own RPC endpoint, separate from the ingest
-	// listener, with bounded workers and admission control. Empty means no
-	// query endpoint.
-	DuckQueryAddr string
-
-	// DuckQueryConcurrency is how many store queries may execute at once per
-	// shard; queries beyond it wait for a slot — toward the request's own
-	// clamped timeout, never past the DefaultQueryQueueWait ceiling — and are
-	// then refused as overloaded, so a burst of heavy queries cannot eat the
-	// machine ingestion needs.
+	// StorageBackend selects where metric data is stored; duck needs a binary
+	// built with the "duckdb" tag and uses the Duck* fields below.
+	StorageBackend       duckstore.StorageBackend
+	DuckStoreDir         string
+	DuckRetention1s      time.Duration // per tier; 0 keeps the tier forever
+	DuckRetention1m      time.Duration
+	DuckRetention1h      time.Duration
 	DuckQueryConcurrency int
-
-	// DuckMemoryLimit is DuckDB's memory_limit per store file, in bytes,
-	// bounding the intermediate state of every query, compaction pass and
-	// seal the shard runs. The default targets the smallest viable node.
-	DuckMemoryLimit int64
+	DuckMemoryLimit      int64
 
 	KHAddr         string
 	KHUser         string
@@ -142,12 +109,11 @@ func DefaultConfigAggregator() ConfigAggregator {
 		LocalReplica:         0, // require setting it explicitly
 		LocalShard:           1,
 
-		DuckRetention1s:        duckstore.DefaultRetention1s,
-		DuckRetention1m:        duckstore.DefaultRetention1m,
-		DuckRetention1h:        duckstore.DefaultRetention1h,
-		DuckFreeSpaceWatermark: int64(duckstore.DefaultFreeSpaceWatermark),
-		DuckQueryConcurrency:   DefaultQueryConcurrency,
-		DuckMemoryLimit:        duckstore.DefaultMemoryLimitBytes,
+		DuckRetention1s:      duckstore.DefaultRetention1s,
+		DuckRetention1m:      duckstore.DefaultRetention1m,
+		DuckRetention1h:      duckstore.DefaultRetention1h,
+		DuckQueryConcurrency: duckstore.DefaultQueryConcurrency,
+		DuckMemoryLimit:      duckstore.DefaultMemoryLimitBytes,
 
 		RemoteInitial: ConfigAggregatorRemote{
 			ShortWindow:               data_model.MaxShortWindow,
@@ -270,62 +236,18 @@ func ValidateConfigAggregator(c *ConfigAggregator) error {
 	if err := c.StorageBackend.Validate(); err != nil {
 		return err
 	}
-	if c.DuckRetention1s < 0 {
-		return fmt.Errorf("--duck-retention-1s (%s) must be >= 0 (0 keeps 1s-tier archive windows forever)", c.DuckRetention1s)
-	}
-	if c.DuckRetention1m < 0 {
-		return fmt.Errorf("--duck-retention-1m (%s) must be >= 0 (0 keeps 1m-tier archive windows forever)", c.DuckRetention1m)
-	}
-	if c.DuckRetention1h < 0 {
-		return fmt.Errorf("--duck-retention-1h (%s) must be >= 0 (0 keeps 1h-tier archive windows forever)", c.DuckRetention1h)
-	}
-	if c.DuckFreeSpaceWatermark < 0 {
-		return fmt.Errorf("--duck-free-space-watermark (%d) must be >= 0 (0 disables early eviction)", c.DuckFreeSpaceWatermark)
-	}
-	if c.DuckQueryConcurrency < 1 {
-		return fmt.Errorf("--duck-query-concurrency (%d) must be >= 1", c.DuckQueryConcurrency)
-	}
-	if c.DuckMemoryLimit <= 0 {
-		return fmt.Errorf("--duck-memory-limit (%d) must be > 0", c.DuckMemoryLimit)
-	}
 	if c.StorageBackend == duckstore.BackendDuck {
-		// One backend per process, and every flag the duck backend needs is
-		// required while every ClickHouse-only one is refused, so a wrong
-		// combination fails at startup naming the flags instead of surfacing
-		// as empty dashboards or dead writes later.
-		if c.KHAddr != "" {
-			return fmt.Errorf("--kh (%s) must not be set when --storage-backend=duck: the duck backend owns storage and has no ClickHouse to talk to", c.KHAddr)
-		}
 		if c.DuckStoreDir == "" {
-			return fmt.Errorf("--duck-store-dir must be set when --storage-backend=duck: the shard's delta generations and archive windows live there")
-		}
-		// The store directory is what the store itself needs; the query
-		// address is what makes the shard readable as a storage backend
-		// rather than a write-only sink, so a duck shard without one is a
-		// misconfiguration rather than a supported mode.
-		if c.DuckQueryAddr == "" {
-			return fmt.Errorf("--duck-query-addr must be set when --storage-backend=duck: the shard serves store queries on its own address")
+			return fmt.Errorf("--duck-store-dir must be set when --storage-backend=duck")
 		}
 		if c.RemoteInitial.MigrationTimeRange != "" {
 			return fmt.Errorf("--migration (%s) must not be set when --storage-backend=duck: the v3-to-v6 migration is ClickHouse-only tooling and has no duck-store counterpart", c.RemoteInitial.MigrationTimeRange)
 		}
-		// There is no ClickHouse cluster to autodetect the shard and replica
-		// from, so the local flags are the only source — and both must be set.
-		if c.LocalReplica < 1 || c.LocalReplica > 3 {
-			return fmt.Errorf("--local-replica (%d) must be 1, 2 or 3 when --storage-backend=duck: there is no ClickHouse cluster to autodetect the replica from", c.LocalReplica)
-		}
 		if c.LocalShard < 1 {
-			return fmt.Errorf("--local-shard (%d) must be >= 1 when --storage-backend=duck: there is no ClickHouse cluster to autodetect the shard from", c.LocalShard)
+			return fmt.Errorf("--local-shard (%d) must be >= 1 when --storage-backend=duck: there is no ClickHouse cluster to detect the shard from", c.LocalShard)
 		}
-	} else {
-		if c.KHAddr == "" {
-			return fmt.Errorf("--kh must be set when --storage-backend=clickhouse: the aggregator has no ClickHouse addresses to write to")
-		}
-		if c.DuckQueryAddr != "" {
-			return fmt.Errorf("--duck-query-addr (%s) is set but --storage-backend is not duck", c.DuckQueryAddr)
-		}
-		if c.DuckStoreDir != "" {
-			return fmt.Errorf("--duck-store-dir (%s) is set but --storage-backend is not duck", c.DuckStoreDir)
+		if c.DuckRetention1s < 0 || c.DuckRetention1m < 0 || c.DuckRetention1h < 0 {
+			return fmt.Errorf("--duck-retention-* must be >= 0 (0 keeps the tier forever)")
 		}
 	}
 	if c.InsertHistoricWhen < 1 {

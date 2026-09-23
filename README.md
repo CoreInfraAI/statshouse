@@ -57,17 +57,10 @@ so please check our earlier documents as well:
 
 ## Storage backends
 
-By default, StatsHouse stores metric data in a ClickHouse cluster. As an
-alternative for small installations, `statshouse-agg` can embed DuckDB as a
-second storage backend, selected per process with `--storage-backend=duck`
-(the aggregator must be built with the `duckdb` build tag, see
-`make build-agg-duckdb`; `statshouse-api` reads it by fanning queries out to
-the aggregator shards via `--duck-shard-query-addrs`). ClickHouse behaviour is
-unchanged except for one flag: `--kh` no longer defaults to
-`127.0.0.1:13338,127.0.0.1:13339` — it is now required with
-`--storage-backend=clickhouse`. See the
-[duck-store operator guide](./docs/duck-store.md) for the flags, retention,
-disk sizing and operational limits.
+By default, StatsHouse stores metric data in a ClickHouse cluster. For small
+installations `statshouse-agg` can instead embed DuckDB, selected with
+`--storage-backend=duck` (build it with `make build-agg-duckdb`); see the
+[duck-store operator guide](./docs/duck-store.md).
 
 ## Presentations
 

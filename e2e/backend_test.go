@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestParseStorageBackend(t *testing.T) {
@@ -213,17 +212,14 @@ func testStackOpts(backend storageBackend) daemonStackOpts {
 }
 
 // TestAggRunScriptDuckFlags pins the duck aggregator's entrypoint: the duck
-// block is present with the store dir and the second (query) listener, the
-// shard/replica is named locally (there is no ClickHouse cluster to autodetect
-// from), and no --kh may survive (duck validation rejects it).
+// block is present with the store dir, the shard is named locally (there is no
+// ClickHouse cluster to autodetect from), and no --kh is passed.
 func TestAggRunScriptDuckFlags(t *testing.T) {
 	script := aggRunScript(testStackOpts(backendDuck), "10.77.0.2")
 	for _, want := range []string{
 		"--storage-backend=duck",
 		"--duck-store-dir=" + duckStoreMount,
-		"--duck-query-addr=0.0.0.0:" + strconv.Itoa(aggQueryPort),
 		"--local-shard=1",
-		"--local-replica=1",
 		"mkdir -p /cache " + duckStoreMount,
 	} {
 		if !strings.Contains(script, want) {
@@ -274,15 +270,12 @@ func TestAggRunScriptClickHouseFlags(t *testing.T) {
 }
 
 // TestAPIDaemonFlagsDuck pins the duck api wiring: the api reads through the
-// aggregator's store-query listener (shard 1 = the single agg the stack runs)
-// instead of ClickHouse, and declares the matching by-metric-id shard count —
-// the api's --duck-shard-query-addrs must cover the count's shards.
+// aggregator (the single shard the stack runs) instead of ClickHouse.
 func TestAPIDaemonFlagsDuck(t *testing.T) {
 	flags := strings.Join(apiDaemonFlags(testStackOpts(backendDuck), "10.77.0.2", "10.77.0.3"), " ")
 	for _, want := range []string{
 		"--storage-backend=duck",
-		"--duck-shard-query-addrs=1=10.77.0.3:" + strconv.Itoa(aggQueryPort),
-		"--shard-by-metric-shards=1",
+		"--duck-shard-addrs=10.77.0.3:" + strconv.Itoa(aggPort),
 	} {
 		if !strings.Contains(flags, want) {
 			t.Errorf("duck api flags missing %q\ngot: %s", want, flags)
@@ -322,33 +315,5 @@ func TestAPIDaemonFlagsSharedAndClickHouse(t *testing.T) {
 		if strings.Contains(chFlags, banned) {
 			t.Errorf("clickhouse api flags must not contain %q\ngot: %s", banned, chFlags)
 		}
-	}
-}
-
-// TestStoreQueryProbeRequest pins the readiness probe's request shape: a
-// one-minute 1-second-LOD window that addresses no metric, so a clean answer
-// proves the store path end-to-end without depending on any journal state.
-func TestStoreQueryProbeRequest(t *testing.T) {
-	now := time.Unix(1_800_000_000, 0)
-	args := storeQueryProbeRequest(now)
-	if args.Base.Lod.StepSec != 1 {
-		t.Errorf("probe StepSec = %d, want 1", args.Base.Lod.StepSec)
-	}
-	if got := args.Base.Lod.ToSec - args.Base.Lod.FromSec; got != 60 {
-		t.Errorf("probe window = %d seconds, want 60", got)
-	}
-	if args.Base.MetricId != 0 || args.Base.IsSetMetricIn() || args.Base.IsSetMetricNotIn() {
-		t.Errorf("probe must address no metric (journal-independent), got id=%d metric_in=%v metric_not_in=%v",
-			args.Base.MetricId, args.Base.IsSetMetricIn(), args.Base.IsSetMetricNotIn())
-	}
-	if len(args.Base.FilterIn) != 0 || len(args.Base.FilterNotIn) != 0 || len(args.What) != 0 || len(args.By) != 0 {
-		t.Errorf("probe must be the empty query: filter_in=%v filter_not_in=%v what=%v by=%v",
-			args.Base.FilterIn, args.Base.FilterNotIn, args.What, args.By)
-	}
-}
-
-func TestStoreQueryAddr(t *testing.T) {
-	if got := storeQueryAddr("10.77.0.3"); got != "10.77.0.3:"+strconv.Itoa(aggQueryPort) {
-		t.Errorf("storeQueryAddr = %q", got)
 	}
 }

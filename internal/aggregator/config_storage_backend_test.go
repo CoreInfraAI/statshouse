@@ -16,118 +16,30 @@ import (
 )
 
 func TestValidateConfigAggregatorStorageBackend(t *testing.T) {
-	c := validClickHouseAggConfig()
+	c := DefaultConfigAggregator()
 	require.Equal(t, duckstore.BackendClickHouse, c.StorageBackend, "clickhouse must be the default backend")
 	require.NoError(t, ValidateConfigAggregator(&c))
 
-	// The query listener's defaults: one admission slot per unit of the
-	// machine's parallelism (floored at two) and the smallest viable DuckDB
-	// memory limit.
-	require.Equal(t, DefaultQueryConcurrency, c.DuckQueryConcurrency)
-	require.Equal(t, int64(duckstore.DefaultMemoryLimitBytes), c.DuckMemoryLimit)
-
-	if duckstore.Available {
-		// A duck shard without a query address is a misconfiguration: the
-		// shard would be a write-only sink no API can read.
-		c := validDuckAggConfig()
-		c.DuckQueryAddr = ""
-		err := ValidateConfigAggregator(&c)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "--duck-query-addr")
-
-		c.DuckQueryAddr = "127.0.0.1:9900"
-		require.NoError(t, ValidateConfigAggregator(&c))
-		return
-	}
 	c.StorageBackend = duckstore.BackendDuck
 	err := ValidateConfigAggregator(&c)
-	require.Error(t, err, "an untagged binary must refuse to start with the duck backend")
-	require.Contains(t, err.Error(), "--storage-backend=duck")
-	require.Contains(t, err.Error(), duckstore.BuildTag)
-}
-
-func TestValidateConfigAggregatorDuckQuery(t *testing.T) {
-	for _, tt := range []struct {
-		name string
-		set  func(*ConfigAggregator)
-		flag string
-	}{
-		{
-			name: "zero query concurrency",
-			set:  func(c *ConfigAggregator) { c.DuckQueryConcurrency = 0 },
-			flag: "--duck-query-concurrency",
-		},
-		{
-			name: "negative query concurrency",
-			set:  func(c *ConfigAggregator) { c.DuckQueryConcurrency = -3 },
-			flag: "--duck-query-concurrency",
-		},
-		{
-			name: "zero memory limit",
-			set:  func(c *ConfigAggregator) { c.DuckMemoryLimit = 0 },
-			flag: "--duck-memory-limit",
-		},
-		{
-			name: "negative memory limit",
-			set:  func(c *ConfigAggregator) { c.DuckMemoryLimit = -1 },
-			flag: "--duck-memory-limit",
-		},
-		{
-			name: "query address without the duck backend",
-			set:  func(c *ConfigAggregator) { c.DuckQueryAddr = "127.0.0.1:9900" },
-			flag: "--duck-query-addr",
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			c := validClickHouseAggConfig()
-			tt.set(&c)
-			err := ValidateConfigAggregator(&c)
-			require.Error(t, err)
-			require.Contains(t, err.Error(), tt.flag, "the error must name the offending flag")
-		})
+	require.Error(t, err)
+	if !duckstore.Available {
+		require.Contains(t, err.Error(), duckstore.BuildTag, "an untagged binary must refuse the duck backend")
+		return
 	}
-}
-
-func TestValidateConfigAggregatorDuckRetention(t *testing.T) {
-	c := validClickHouseAggConfig()
-	require.Equal(t, duckstore.DefaultRetention1s, c.DuckRetention1s)
-	require.Equal(t, duckstore.DefaultRetention1m, c.DuckRetention1m)
-	require.Equal(t, duckstore.DefaultRetention1h, c.DuckRetention1h)
-	require.Equal(t, int64(duckstore.DefaultFreeSpaceWatermark), c.DuckFreeSpaceWatermark)
+	require.Contains(t, err.Error(), "--duck-store-dir")
+	c.DuckStoreDir = t.TempDir()
 	require.NoError(t, ValidateConfigAggregator(&c))
 
-	for _, tt := range []struct {
-		name string
-		set  func(*ConfigAggregator)
-		flag string
-	}{
-		{
-			name: "negative 1s retention",
-			set:  func(c *ConfigAggregator) { c.DuckRetention1s = -time.Second },
-			flag: "--duck-retention-1s",
-		},
-		{
-			name: "negative 1m retention",
-			set:  func(c *ConfigAggregator) { c.DuckRetention1m = -time.Second },
-			flag: "--duck-retention-1m",
-		},
-		{
-			name: "negative 1h retention",
-			set:  func(c *ConfigAggregator) { c.DuckRetention1h = -time.Second },
-			flag: "--duck-retention-1h",
-		},
-		{
-			name: "negative watermark",
-			set:  func(c *ConfigAggregator) { c.DuckFreeSpaceWatermark = -1 },
-			flag: "--duck-free-space-watermark",
-		},
+	for flag, set := range map[string]func(*ConfigAggregator){
+		"--migration":       func(c *ConfigAggregator) { c.RemoteInitial.MigrationTimeRange = "1-2" },
+		"--local-shard":     func(c *ConfigAggregator) { c.LocalShard = 0 },
+		"--duck-retention-": func(c *ConfigAggregator) { c.DuckRetention1m = -time.Second },
 	} {
-		t.Run(tt.name, func(t *testing.T) {
-			c := validClickHouseAggConfig()
-			tt.set(&c)
-			err := ValidateConfigAggregator(&c)
-			require.Error(t, err)
-			require.Contains(t, err.Error(), tt.flag, "the error must name the offending flag")
-		})
+		bad := c
+		set(&bad)
+		err := ValidateConfigAggregator(&bad)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), flag)
 	}
 }

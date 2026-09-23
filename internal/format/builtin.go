@@ -167,8 +167,6 @@ var (
 		-153:                                    BuiltinMetricMetaMappingUsage,
 		-156:                                    BuiltinMetricMetaAggTagMapperInfo,
 		-157:                                    BuiltinMetricMetaDuckMaintenanceTime,
-		-158:                                    BuiltinMetricMetaDuckWindows,
-		-159:                                    BuiltinMetricMetaDuckQuarantinedFiles,
 		-160:                                    BuiltinMetricMetaDuckQueryTime,
 		-161:                                    BuiltinMetricMetaDuckStoreSize,
 		-162:                                    BuiltinMetricMetaDuckBacklog,

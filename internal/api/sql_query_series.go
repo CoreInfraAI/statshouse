@@ -19,7 +19,8 @@ var filterOperatorIn = filterOperator{operatorIn, " OR "}
 var filterOperatorNotIn = filterOperator{operatorNotIn, " AND "}
 var escapeReplacer = strings.NewReplacer(`'`, `\'`, `\`, `\\`)
 
-func (b *queryBuilder) buildSeriesQuery(lod data_model.LOD, settings string) (*seriesQuery, error) {
+func (b *queryBuilder) buildSeriesQuery(lod data_model.LOD, dialect sqlDialect) (*seriesQuery, error) {
+	b.duck = dialect.duck
 	q := &seriesQuery{
 		queryBuilder: b,
 	}
@@ -36,7 +37,7 @@ func (b *queryBuilder) buildSeriesQuery(lod data_model.LOD, settings string) (*s
 		q.writeOrderBy(&sb, &lod)
 	}
 	sb.WriteString(fmt.Sprintf(" LIMIT %v", limit))
-	sb.WriteString(settings)
+	sb.WriteString(dialect.settings)
 	q.body = sb.String()
 	return q, nil
 }
@@ -53,7 +54,11 @@ func (q *seriesQuery) writeSelect(sb *strings.Builder, lod *data_model.LOD) erro
 
 func (q *seriesQuery) writeSelectTime(sb *strings.Builder, lod *data_model.LOD, comma *listItemSeparator) {
 	comma.maybeWrite(sb)
-	if lod.StepSec == _1M {
+	if q.duck && lod.StepSec == _1M {
+		sb.WriteString(fmt.Sprintf("CAST(epoch(timezone('%[1]s',date_trunc('month',timezone('%[1]s',to_timestamp(time))))) AS BIGINT)", lod.Location.String()))
+	} else if q.duck {
+		sb.WriteString(fmt.Sprintf("(time+%d)//%d*%d-%d", q.utcOffset, lod.StepSec, lod.StepSec, q.utcOffset))
+	} else if lod.StepSec == _1M {
 		sb.WriteString(fmt.Sprintf("toInt64(toDateTime(toStartOfInterval(time,INTERVAL 1 MONTH,'%s'),'%s'))", lod.Location.String(), lod.Location.String()))
 	} else {
 		sb.WriteString(fmt.Sprintf("toInt64(toStartOfInterval(time+%d,INTERVAL %d second))-%d", q.utcOffset, lod.StepSec, q.utcOffset))
@@ -128,7 +133,11 @@ func (q *seriesQuery) writeSelectValues(sb *strings.Builder, lod *data_model.LOD
 			columnName := fmt.Sprintf("_val%d", j)
 			q.res = append(q.res, proto.ResultColumn{Name: columnName, Data: &q.percentile})
 			comma.maybeWrite(sb)
-			sb.WriteString("quantilesTDigestMergeState(0.5)(percentiles)")
+			if q.duck {
+				sb.WriteString("sh_merge_percentiles(list(percentiles))")
+			} else {
+				sb.WriteString("quantilesTDigestMergeState(0.5)(percentiles)")
+			}
 			sb.WriteString(" AS ")
 			sb.WriteString(columnName)
 			j++
@@ -354,7 +363,7 @@ func (b *queryBuilder) writeTagFilter(sb *strings.Builder, lod *data_model.LOD, 
 				sb.WriteString("match(")
 				sb.WriteString(b.colStr(tagX))
 				sb.WriteString(",'")
-				sb.WriteString(escapeReplacer.Replace(filter.Re2))
+				sb.WriteString(b.escape(filter.Re2))
 				sb.WriteString("')")
 			} else if hasValue {
 				hasValue = false
@@ -376,7 +385,7 @@ func (b *queryBuilder) writeTagFilter(sb *strings.Builder, lod *data_model.LOD, 
 						} else {
 							sb.WriteString("','")
 						}
-						sb.WriteString(escapeReplacer.Replace(v.Value))
+						sb.WriteString(b.escape(v.Value))
 					}
 				}
 				sb.WriteString("')")

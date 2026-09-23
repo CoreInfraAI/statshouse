@@ -23,6 +23,8 @@ const (
 	_24h = 24 * _1h
 	_7d  = 7 * _24h
 	_1M  = 31 * _24h
+
+	_1sTableSH3 = "statshouse_v6_1s_dist"
 )
 
 func mathDiv(a int64, b int64) int64 {

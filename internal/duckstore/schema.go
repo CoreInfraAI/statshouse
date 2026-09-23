@@ -8,271 +8,123 @@ package duckstore
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 
+	"github.com/VKCOM/statshouse/internal/data_model"
 	"github.com/VKCOM/statshouse/internal/format"
 )
 
-// The duck-store on-disk schema version is two axes, one per file kind:
-// DeltaSchemaVersion stamps delta generation files, ArchiveSchemaVersion
-// stamps archive window files. Every store file carries the version of its
-// own kind that wrote it; a file whose stamp does not match the running
-// binary on its kind's axis is quarantined, never upgraded in place and
-// never read through a compatibility shim — ADR-0002's exact-match rule,
-// held by each axis separately. The axes are separate because the two kinds
-// have different lifetimes: delta generations are transient by design, while
-// archive windows are the store's whole history, and a layout change to one
-// kind must never evict the other's files (ADR-0005).
+// SchemaVersion stamps the store file. A file stamped with another version is
+// moved aside on open and a fresh one created: files are never upgraded in
+// place and never read through a compatibility shim.
 //
-// History (shared until the axes split at 4, so each axis starts there):
-//
-//	1: initial layout — tier tables plus the version stamp
-//	2: every store file also carries duck_store_consumed
-//	3: every store file also carries duck_store_sealed
-//	4: host columns also carry their skewed argMin/argMax state values
-//	   (the axes split here; from now on a delta-only change bumps only
-//	   DeltaSchemaVersion and an archive-only change only
-//	   ArchiveSchemaVersion)
-//	5 (delta axis): delta generations hold the 1s tier table only; the
-//	   coarser tiers derive from it at compaction and read time
-const (
-	DeltaSchemaVersion   = 5
-	ArchiveSchemaVersion = 4
-)
+//	1: rows_1s/1m/1h tier tables in ClickHouse's statshouse_v6 column layout
+const SchemaVersion = 1
 
-// fileKind is which of the store's two file kinds a file is: a delta
-// generation the writer appends to, or an archive window compaction
-// produces. The kinds' layouts evolve independently, so the schema-version
-// axis a file is stamped with and verified against is its own kind's. The
-// kind is a property of the file's name and directory, not of its contents:
-// nothing on disk records it, and nothing needs to, because every open path
-// already knows which kind of file it is opening.
-type fileKind int
-
-const (
-	fileKindDelta   fileKind = iota // delta-<generation>.duckdb in the store root
-	fileKindArchive                 // <tier>-<window>.duckdb under the archive directory
-)
-
-// label names the kind in operator-facing messages, such as the quarantine
-// reason a stamp mismatch produces.
-func (k fileKind) label() string {
-	switch k {
-	case fileKindDelta:
-		return "delta"
-	default:
-		return "archive"
-	}
+// tier is one resolution table: rows are stored with time truncated to the
+// tier, exactly like ClickHouse's statshouse_v6_1s/1m/1h.
+type tier struct {
+	table   string // physical table
+	chTable string // the ClickHouse table the API's SQL names
+	seconds int64
 }
 
-// VersionTable is the version-stamp table written into every store file
-// (delta generations and archive windows alike). It carries the version axes
-// the store verifies on open: the file's own kind's duck-store schema version
-// (delta files against DeltaSchemaVersion, archive windows against
-// ArchiveSchemaVersion), the DuckDB version that wrote the file and the
-// StatsHouse version that wrote it. The table's shape is identical for both
-// kinds; only the meaning of the schema_version column is scoped by kind.
-const VersionTable = "duck_store_version"
+var tiers = []tier{
+	{"rows_1s", data_model.LODTables[data_model.Version6][1], 1},
+	{"rows_1m", data_model.LODTables[data_model.Version6][60], 60},
+	{"rows_1h", data_model.LODTables[data_model.Version6][3600], 3600},
+}
 
-// VersionTableDDL creates the version-stamp table (see VersionTable).
-const VersionTableDDL = "CREATE TABLE IF NOT EXISTS " + VersionTable + " (" +
-	"schema_version INTEGER NOT NULL, " +
-	"storage_version VARCHAR NOT NULL, " +
-	"statshouse_version VARCHAR NOT NULL)"
+// The collapse aggregate of every non-key column, as ClickHouse's
+// AggregatingMergeTree defines it for statshouse_v6. The aggregate-state
+// columns hold ClickHouse's own state bytes, merged by the Go folds (fold.go)
+// registered as UDFs.
+var valueColumns = []struct{ name, collapse string }{
+	{"count", "sum(count)"},
+	{"max_count", "max(max_count)"},
+	{"min", "min(min)"},
+	{"max", "max(max)"},
+	{"sum", "sum(sum)"},
+	{"sumsquare", "sum(sumsquare)"},
+	{"percentiles", udfMergePercentiles + "(list(percentiles))"},
+	{"uniq_state", udfMergeUniq + "(list(uniq_state))"},
+	{"min_host", udfMergeArgMin + "(list(min_host))"},
+	{"max_host", udfMergeArgMax + "(list(max_host))"},
+	{"max_count_host", udfMergeArgMax + "(list(max_count_host))"},
+}
 
-// ConsumedTable is the metadata table every store file carries, read from
-// archive window files: one row per delta generation whose rows the window
-// already holds. Compaction writes the record in the same DuckDB transaction
-// as the append, so a crash between the two can leave neither rows without
-// the record nor the record without the rows — and a resumed consumption
-// skips a recorded window instead of appending to it twice.
-const ConsumedTable = "duck_store_consumed"
-
-// ConsumedTableDDL creates the consumed-generations table (see ConsumedTable).
-const ConsumedTableDDL = "CREATE TABLE IF NOT EXISTS " + ConsumedTable + " (" +
-	"generation BIGINT NOT NULL)"
-
-// SealedTable is the metadata table archive window files carry: it holds a row
-// once the window is sealed — its runs rewritten into one and its contents
-// immutable from then on. The marker is written in the same DuckDB transaction as the rewrite,
-// so the two can never disagree. The store reads it to refuse every later
-// write to the file and to serve it read-only; retention and operators may
-// still unlink or copy the file, which is the only thing that can happen to it.
-const SealedTable = "duck_store_sealed"
-
-// SealedTableDDL creates the sealed-marker table (see SealedTable).
-const SealedTableDDL = "CREATE TABLE IF NOT EXISTS " + SealedTable + " (" +
-	"sealed BOOLEAN NOT NULL)"
-
-// Tier names, used both as archive file-name prefixes and to map a tier to its
-// table. A delta generation holds the 1s tier table alone — the writer appends
-// each row once and the coarser tiers derive from those 1s rows at compaction
-// and read time (see tierTimeExpr); an archive window file holds exactly the
-// one table of its tier.
+// Names of the aggregate-state folds (LIST(BLOB) -> BLOB).
 const (
-	Tier1s = "1s"
-	Tier1m = "1m"
-	Tier1h = "1h"
+	udfMergePercentiles = "sh_merge_percentiles"
+	udfMergeUniq        = "sh_merge_uniq"
+	udfMergeArgMin      = "sh_merge_argmin"
+	udfMergeArgMax      = "sh_merge_argmax"
 )
 
-// tiers is the canonical tier order.
-var tiers = []string{Tier1s, Tier1m, Tier1h}
-
-var tierTables = map[string]string{
-	Tier1s: "s1",
-	Tier1m: "s1m",
-	Tier1h: "s1h",
-}
-
-var tierSeconds = map[string]int64{
-	Tier1s: 1,
-	Tier1m: 60,
-	Tier1h: 3600,
-}
-
-// tierColumns is the tier tables' column list in DDL order — the shape every
-// whole-row projection enumerates when it must substitute one column, which
-// SELECT * cannot express.
-var tierColumns = func() []string {
+// keyColumns are the columns rows collapse by.
+var keyColumns = func() []string {
 	cols := []string{"metric", "time"}
 	for i := 0; i < format.MaxTags; i++ {
 		cols = append(cols, fmt.Sprintf("tag%d", i), fmt.Sprintf("stag%d", i))
 	}
-	return append(cols,
-		"count", "min", "max", "max_count", "sum", "sumsquare",
-		"min_host", "min_shost", "min_host_value",
-		"max_host", "max_shost", "max_host_value",
-		"max_count_host", "max_count_shost", "max_count_host_value",
-		"percentiles", "uniq_state")
+	return cols
 }()
 
-// tierTimeExpr returns the SQL expression over a 1s-tier time column that
-// yields the tier's own bucket start: the plain column for 1s, the floor
-// truncation for the coarser tiers (times are unix seconds and never
-// negative, so the floor and Go's truncation toward zero agree). Because
-// every window length is a whole multiple of its tier's seconds, truncating
-// to the tier first never moves a row across a window edge — the derived
-// bucket is exactly the one the old per-tier tables held, so deriving the
-// coarse tiers from the 1s rows loses nothing.
-func tierTimeExpr(tier string) string {
-	if tier == Tier1s {
-		return "time"
-	}
-	return fmt.Sprintf("time - time %% %d", tierSeconds[tier])
-}
-
-// derivedTierSelect returns the tier tables' whole-row select list with time
-// read through expr: the star when expr is the time column itself — keeping
-// every 1s-tier and archive statement byte-identical — else every column
-// with the expression projected AS time. Whatever filters rows must use the
-// same expression too, or an unaligned range would keep partial leading
-// buckets and drop trailing ones.
-func derivedTierSelect(expr string) string {
-	if expr == "time" {
-		return "*"
-	}
-	parts := make([]string, 0, len(tierColumns))
-	for _, c := range tierColumns {
-		if c == "time" {
-			parts = append(parts, expr+" AS time")
-			continue
-		}
-		parts = append(parts, c)
-	}
-	return strings.Join(parts, ", ")
-}
-
-// TierTable returns the table name a tier is stored in.
-func TierTable(tier string) string {
-	return tierTables[tier]
-}
-
-// TierTableDDL returns the CREATE TABLE statement for one tier table: the
-// transliteration of .scratch/duck-store/03-schema-ddl.sql. Every column is
-// NOT NULL with a zero-value default (the API compares empty string tags
-// directly and NULLs would make three-valued logic silently drop rows), time
-// is BIGINT unix seconds, aggregate states stay opaque ClickHouse bytes in BLOB,
-// and there is deliberately no primary key, unique constraint or index:
-// partial rows repeat the key and an index would cost Appender throughput.
 func tierTableDDL(table string) string {
 	var b strings.Builder
-	b.WriteString("CREATE TABLE IF NOT EXISTS " + table + " (\n")
-	b.WriteString("    metric INTEGER NOT NULL,\n")
-	b.WriteString("    time   BIGINT  NOT NULL, -- unix seconds, already truncated to the tier\n")
+	b.WriteString("CREATE TABLE IF NOT EXISTS " + table + " (metric INTEGER NOT NULL, time BIGINT NOT NULL")
 	for i := 0; i < format.MaxTags; i++ {
-		fmt.Fprintf(&b, "    tag%d  INTEGER NOT NULL DEFAULT 0,\n", i)
-		fmt.Fprintf(&b, "    stag%d VARCHAR NOT NULL DEFAULT '',\n", i)
+		fmt.Fprintf(&b, ", tag%d INTEGER NOT NULL, stag%d VARCHAR NOT NULL", i, i)
 	}
-	for _, c := range []string{"count", "min", "max", "max_count", "sum", "sumsquare"} {
-		fmt.Fprintf(&b, "    %s DOUBLE NOT NULL DEFAULT 0,\n", c)
+	for _, c := range valueColumns[:6] {
+		b.WriteString(", " + c.name + " DOUBLE NOT NULL")
 	}
-	// Each host triple is ClickHouse's AggregateFunction(argMin/argMax, String,
-	// Float32) column unrolled: the tag halves plus the skewed comparison
-	// value the conveyor draws once per row (see data_model.SkewMinMaxHost —
-	// host selection is value-weighted, not a plain extremum). Merges order
-	// by the value and serve it back, exactly as the state does.
-	b.WriteString("    min_host             INTEGER NOT NULL DEFAULT 0,\n")
-	b.WriteString("    min_shost            VARCHAR NOT NULL DEFAULT '',\n")
-	b.WriteString("    min_host_value       DOUBLE NOT NULL DEFAULT 0,\n")
-	b.WriteString("    max_host             INTEGER NOT NULL DEFAULT 0,\n")
-	b.WriteString("    max_shost            VARCHAR NOT NULL DEFAULT '',\n")
-	b.WriteString("    max_host_value       DOUBLE NOT NULL DEFAULT 0,\n")
-	b.WriteString("    max_count_host       INTEGER NOT NULL DEFAULT 0,\n")
-	b.WriteString("    max_count_shost      VARCHAR NOT NULL DEFAULT '',\n")
-	b.WriteString("    max_count_host_value DOUBLE NOT NULL DEFAULT 0,\n")
-	b.WriteString("    percentiles BLOB NOT NULL DEFAULT ''::BLOB,\n")
-	b.WriteString("    uniq_state  BLOB NOT NULL DEFAULT ''::BLOB\n)")
+	for _, c := range valueColumns[6:] {
+		b.WriteString(", " + c.name + " BLOB NOT NULL")
+	}
+	b.WriteString(")")
 	return b.String()
 }
 
-// deltaFileName returns the name of delta generation N's file.
-func deltaFileName(generation int64) string {
-	return fmt.Sprintf("delta-%d.duckdb", generation)
+// collapseSQL folds the rows of the given buckets of one tier into one row per
+// key, in place. It runs inside a transaction; rows appended concurrently are
+// invisible to it and so survive untouched.
+func collapseSQL(table string, buckets string) []string {
+	sel := make([]string, 0, len(keyColumns)+len(valueColumns))
+	sel = append(sel, keyColumns...)
+	for _, c := range valueColumns {
+		sel = append(sel, c.collapse+" AS "+c.name)
+	}
+	where := " WHERE time IN (" + buckets + ")"
+	return []string{
+		"CREATE OR REPLACE TEMP TABLE collapsed AS SELECT " + strings.Join(sel, ", ") + " FROM " + table + where + " GROUP BY ALL",
+		"DELETE FROM " + table + where,
+		"INSERT INTO " + table + " SELECT * FROM collapsed",
+		"DROP TABLE collapsed",
+	}
 }
 
-// parseDeltaFileName parses a delta file name. ok is false for anything that
-// is not a delta generation, so unknown files are simply ignored rather than
-// misinterpreted.
-func parseDeltaFileName(name string) (generation int64, ok bool) {
-	s, ok := strings.CutPrefix(name, "delta-")
-	if !ok {
-		return 0, false
+// compatSQL is the thin ClickHouse compatibility layer that lets the API send
+// the SQL its ClickHouse query builder renders: views named after the
+// ClickHouse tables (with the columns ClickHouse queries filter on but duck
+// does not store, and _shard_num, the Distributed table's virtual column),
+// and macros for the ClickHouse functions the builder calls. What cannot be
+// expressed this way (parametric aggregates, INTERVAL arithmetic, string
+// escaping) the builder renders differently for duck.
+func compatSQL(shardNum int) []string {
+	stmts := []string{
+		"CREATE OR REPLACE MACRO toFloat64(x) AS CAST(x AS DOUBLE)",
+		"CREATE OR REPLACE MACRO toInt64(x) AS CAST(x AS BIGINT)",
+		"CREATE OR REPLACE MACRO match(s, re) AS regexp_matches(s, re)",
+		"CREATE OR REPLACE MACRO uniqMergeState(x) AS " + udfMergeUniq + "(list(x))",
+		"CREATE OR REPLACE MACRO argMinMergeState(x) AS " + udfMergeArgMin + "(list(x))",
+		"CREATE OR REPLACE MACRO argMaxMergeState(x) AS " + udfMergeArgMax + "(list(x))",
 	}
-	s, ok = strings.CutSuffix(s, ".duckdb")
-	if !ok {
-		return 0, false
+	for _, t := range tiers {
+		sel := fmt.Sprintf("SELECT *, 0::UTINYINT AS index_type, 0 AS pre_tag, '' AS pre_stag, %d::UINTEGER AS _shard_num FROM %s", shardNum, t.table)
+		for _, name := range []string{t.chTable, t.chTable + format.TableDistSuffix} {
+			stmts = append(stmts, "CREATE OR REPLACE VIEW "+name+" AS "+sel)
+		}
 	}
-	gen, err := strconv.ParseInt(s, 10, 64)
-	if err != nil || gen < 0 {
-		return 0, false
-	}
-	return gen, true
-}
-
-// archiveFileName returns the name of an archive window file.
-func archiveFileName(tier string, windowStart int64) string {
-	return fmt.Sprintf("%s-%d.duckdb", tier, windowStart)
-}
-
-// parseArchiveFileName parses an archive window file name into its tier and
-// window start. ok is false for anything that is not an archive window, so
-// unknown files are simply ignored rather than misinterpreted.
-func parseArchiveFileName(name string) (tier string, windowStart int64, ok bool) {
-	ext, isDuck := strings.CutSuffix(name, ".duckdb")
-	if !isDuck {
-		return "", 0, false
-	}
-	prefix, rest, found := strings.Cut(ext, "-")
-	if !found {
-		return "", 0, false
-	}
-	if _, knownTier := tierTables[prefix]; !knownTier {
-		return "", 0, false
-	}
-	start, err := strconv.ParseInt(rest, 10, 64)
-	if err != nil || start < 0 {
-		return "", 0, false
-	}
-	return prefix, start, true
+	return stmts
 }

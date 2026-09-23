@@ -72,23 +72,10 @@ type (
 	ShutdownInfo                      = internal.StatshouseShutdownInfo
 	SourceBucket3                     = internal.StatshouseSourceBucket3
 	SourceBucket3Bytes                = internal.StatshouseSourceBucket3Bytes
-	StoreLod                          = internal.StatshouseStoreLod
-	StoreLodBytes                     = internal.StatshouseStoreLodBytes
-	StoreQueryBase                    = internal.StatshouseStoreQueryBase
-	StoreQueryBaseBytes               = internal.StatshouseStoreQueryBaseBytes
-	StoreQuerySeries                  = internal.StatshouseStoreQuerySeries
-	StoreQuerySeriesBytes             = internal.StatshouseStoreQuerySeriesBytes
-	StoreQueryTagValues               = internal.StatshouseStoreQueryTagValues
-	StoreQueryTagValuesBytes          = internal.StatshouseStoreQueryTagValuesBytes
-	StoreSeriesBatch                  = internal.StatshouseStoreSeriesBatch
-	StoreSeriesBatchBytes             = internal.StatshouseStoreSeriesBatchBytes
-	StoreSeriesResponse               = internal.StatshouseStoreSeriesResponse
-	StoreSeriesResponseBytes          = internal.StatshouseStoreSeriesResponseBytes
-	StoreTagFilter                    = internal.StatshouseStoreTagFilter
-	StoreTagFilterBytes               = internal.StatshouseStoreTagFilterBytes
-	StoreTagLayout                    = internal.StatshouseStoreTagLayout
-	StoreTagValuesResponse            = internal.StatshouseStoreTagValuesResponse
-	StoreTagValuesResponseBytes       = internal.StatshouseStoreTagValuesResponseBytes
+	StoreQuery                        = internal.StatshouseStoreQuery
+	StoreQueryBytes                   = internal.StatshouseStoreQueryBytes
+	StoreQueryResponse                = internal.StatshouseStoreQueryResponse
+	StoreQueryResponseBytes           = internal.StatshouseStoreQueryResponseBytes
 	TestConnection2                   = internal.StatshouseTestConnection2
 	TestConnection2Bytes              = internal.StatshouseTestConnection2Bytes
 	TopElement                        = internal.StatshouseTopElement
@@ -105,10 +92,6 @@ type (
 	VectorPromTarget                  = internal.VectorStatshousePromTarget
 	VectorPromTargetBytes             = internal.VectorStatshousePromTargetBytes
 	VectorSampleFactor                = internal.VectorStatshouseSampleFactor
-	VectorStoreSeriesBatchBoxed       = internal.VectorStatshouseStoreSeriesBatchBoxed
-	VectorStoreSeriesBatchBoxedBytes  = internal.VectorStatshouseStoreSeriesBatchBoxedBytes
-	VectorStoreTagFilterBoxed         = internal.VectorStatshouseStoreTagFilterBoxed
-	VectorStoreTagFilterBoxedBytes    = internal.VectorStatshouseStoreTagFilterBoxedBytes
 	VectorTopElement                  = internal.VectorStatshouseTopElement
 	VectorTopElementBytes             = internal.VectorStatshouseTopElementBytes
 
@@ -824,23 +807,13 @@ func (c *Client) SendSourceBucket3(ctx context.Context, args SendSourceBucket3, 
 	return nil
 }
 
-// The series verb. Covers every read surface that goes through buildSeriesQuery
-// today — series, point queries, the table view, cardinality, PromQL series and
-// the 1/sec cache-invalidation log query (a tag-only series query: empty `what`,
-// group by tag1). what[] carries data_model.DigestSelector kinds; an empty
-// what[] is legal and means "grouped tags and timestamps only". by[] carries
-// grouped tag indices; format.ShardTagIndex (-3) is legal and is answered from
-// shard_num, not from storage.
-//
-// Row limit semantics: the aggregator executes with LIMIT row_limit+1, because
-// LIMIT N cannot distinguish "exactly N rows" from truncation. If the extra row
-// appears the call FAILS with row_limit — a partial series result is never
-// returned and never cached by the API.
-func (c *Client) StoreQuerySeriesBytes(ctx context.Context, args StoreQuerySeriesBytes, extra *rpc.InvokeReqExtra, ret *StoreSeriesResponseBytes) (err error) {
+// Runs one SELECT against the aggregator's duck-store. The API renders the
+// SQL with the same builder it uses for ClickHouse.
+func (c *Client) StoreQueryBytes(ctx context.Context, args StoreQueryBytes, extra *rpc.InvokeReqExtra, ret *StoreQueryResponseBytes) (err error) {
 	req := c.Client.GetRequest()
 	req.ActorID = c.ActorID
 	req.ReadOnly = true
-	req.FunctionName = "statshouse.storeQuerySeries"
+	req.FunctionName = "statshouse.storeQuery"
 	if extra != nil {
 		req.Extra = extra.RequestExtra
 		req.FailIfNoConnection = extra.FailIfNoConnection
@@ -849,7 +822,7 @@ func (c *Client) StoreQuerySeriesBytes(ctx context.Context, args StoreQuerySerie
 	rpc.UpdateExtraTimeout(&req.Extra, c.Timeout)
 	req.Body, err = args.WriteTL1BoxedGeneral(req.Body)
 	if err != nil {
-		return internal.ErrorClientWrite("statshouse.storeQuerySeries", err)
+		return internal.ErrorClientWrite("statshouse.storeQuery", err)
 	}
 	resp, err := c.Client.Do(ctx, c.Network, c.Address, req)
 	if extra != nil && resp != nil {
@@ -857,34 +830,24 @@ func (c *Client) StoreQuerySeriesBytes(ctx context.Context, args StoreQuerySerie
 	}
 	defer c.Client.PutResponse(resp)
 	if err != nil {
-		return internal.ErrorClientDo("statshouse.storeQuerySeries", c.Network, c.ActorID, c.Address, err)
+		return internal.ErrorClientDo("statshouse.storeQuery", c.Network, c.ActorID, c.Address, err)
 	}
 	if ret != nil {
 		resp.Body, err = args.ReadResultTL1(resp.Body, ret)
 		if err != nil {
-			return internal.ErrorClientReadResult("statshouse.storeQuerySeries", c.Network, c.ActorID, c.Address, err)
+			return internal.ErrorClientReadResult("statshouse.storeQuery", c.Network, c.ActorID, c.Address, err)
 		}
 	}
 	return nil
 }
 
-// The series verb. Covers every read surface that goes through buildSeriesQuery
-// today — series, point queries, the table view, cardinality, PromQL series and
-// the 1/sec cache-invalidation log query (a tag-only series query: empty `what`,
-// group by tag1). what[] carries data_model.DigestSelector kinds; an empty
-// what[] is legal and means "grouped tags and timestamps only". by[] carries
-// grouped tag indices; format.ShardTagIndex (-3) is legal and is answered from
-// shard_num, not from storage.
-//
-// Row limit semantics: the aggregator executes with LIMIT row_limit+1, because
-// LIMIT N cannot distinguish "exactly N rows" from truncation. If the extra row
-// appears the call FAILS with row_limit — a partial series result is never
-// returned and never cached by the API.
-func (c *Client) StoreQuerySeries(ctx context.Context, args StoreQuerySeries, extra *rpc.InvokeReqExtra, ret *StoreSeriesResponse) (err error) {
+// Runs one SELECT against the aggregator's duck-store. The API renders the
+// SQL with the same builder it uses for ClickHouse.
+func (c *Client) StoreQuery(ctx context.Context, args StoreQuery, extra *rpc.InvokeReqExtra, ret *StoreQueryResponse) (err error) {
 	req := c.Client.GetRequest()
 	req.ActorID = c.ActorID
 	req.ReadOnly = true
-	req.FunctionName = "statshouse.storeQuerySeries"
+	req.FunctionName = "statshouse.storeQuery"
 	if extra != nil {
 		req.Extra = extra.RequestExtra
 		req.FailIfNoConnection = extra.FailIfNoConnection
@@ -893,7 +856,7 @@ func (c *Client) StoreQuerySeries(ctx context.Context, args StoreQuerySeries, ex
 	rpc.UpdateExtraTimeout(&req.Extra, c.Timeout)
 	req.Body, err = args.WriteTL1BoxedGeneral(req.Body)
 	if err != nil {
-		return internal.ErrorClientWrite("statshouse.storeQuerySeries", err)
+		return internal.ErrorClientWrite("statshouse.storeQuery", err)
 	}
 	resp, err := c.Client.Do(ctx, c.Network, c.Address, req)
 	if extra != nil && resp != nil {
@@ -901,90 +864,12 @@ func (c *Client) StoreQuerySeries(ctx context.Context, args StoreQuerySeries, ex
 	}
 	defer c.Client.PutResponse(resp)
 	if err != nil {
-		return internal.ErrorClientDo("statshouse.storeQuerySeries", c.Network, c.ActorID, c.Address, err)
+		return internal.ErrorClientDo("statshouse.storeQuery", c.Network, c.ActorID, c.Address, err)
 	}
 	if ret != nil {
 		resp.Body, err = args.ReadResultTL1(resp.Body, ret)
 		if err != nil {
-			return internal.ErrorClientReadResult("statshouse.storeQuerySeries", c.Network, c.ActorID, c.Address, err)
-		}
-	}
-	return nil
-}
-
-// The tag-values verb, covering both the values and the ids-only mode.
-//
-// CRITICAL: the aggregator MUST NOT apply the user's top-N. A value ranked below
-// N on every individual shard can still be globally top-N once counts are
-// summed, so per-shard top-N silently returns wrong answers. The aggregator
-// returns ALL values up to row_limit (a safety cap, not the user's N) and fails
-// on truncation; the API sums counts across shards and takes the global top N.
-func (c *Client) StoreQueryTagValuesBytes(ctx context.Context, args StoreQueryTagValuesBytes, extra *rpc.InvokeReqExtra, ret *StoreTagValuesResponseBytes) (err error) {
-	req := c.Client.GetRequest()
-	req.ActorID = c.ActorID
-	req.ReadOnly = true
-	req.FunctionName = "statshouse.storeQueryTagValues"
-	if extra != nil {
-		req.Extra = extra.RequestExtra
-		req.FailIfNoConnection = extra.FailIfNoConnection
-		req.DoNotCreateLocalCancellationContext = extra.DoNotCreateLocalCancellationContext
-	}
-	rpc.UpdateExtraTimeout(&req.Extra, c.Timeout)
-	req.Body, err = args.WriteTL1BoxedGeneral(req.Body)
-	if err != nil {
-		return internal.ErrorClientWrite("statshouse.storeQueryTagValues", err)
-	}
-	resp, err := c.Client.Do(ctx, c.Network, c.Address, req)
-	if extra != nil && resp != nil {
-		extra.ResponseExtra = resp.Extra
-	}
-	defer c.Client.PutResponse(resp)
-	if err != nil {
-		return internal.ErrorClientDo("statshouse.storeQueryTagValues", c.Network, c.ActorID, c.Address, err)
-	}
-	if ret != nil {
-		resp.Body, err = args.ReadResultTL1(resp.Body, ret)
-		if err != nil {
-			return internal.ErrorClientReadResult("statshouse.storeQueryTagValues", c.Network, c.ActorID, c.Address, err)
-		}
-	}
-	return nil
-}
-
-// The tag-values verb, covering both the values and the ids-only mode.
-//
-// CRITICAL: the aggregator MUST NOT apply the user's top-N. A value ranked below
-// N on every individual shard can still be globally top-N once counts are
-// summed, so per-shard top-N silently returns wrong answers. The aggregator
-// returns ALL values up to row_limit (a safety cap, not the user's N) and fails
-// on truncation; the API sums counts across shards and takes the global top N.
-func (c *Client) StoreQueryTagValues(ctx context.Context, args StoreQueryTagValues, extra *rpc.InvokeReqExtra, ret *StoreTagValuesResponse) (err error) {
-	req := c.Client.GetRequest()
-	req.ActorID = c.ActorID
-	req.ReadOnly = true
-	req.FunctionName = "statshouse.storeQueryTagValues"
-	if extra != nil {
-		req.Extra = extra.RequestExtra
-		req.FailIfNoConnection = extra.FailIfNoConnection
-		req.DoNotCreateLocalCancellationContext = extra.DoNotCreateLocalCancellationContext
-	}
-	rpc.UpdateExtraTimeout(&req.Extra, c.Timeout)
-	req.Body, err = args.WriteTL1BoxedGeneral(req.Body)
-	if err != nil {
-		return internal.ErrorClientWrite("statshouse.storeQueryTagValues", err)
-	}
-	resp, err := c.Client.Do(ctx, c.Network, c.Address, req)
-	if extra != nil && resp != nil {
-		extra.ResponseExtra = resp.Extra
-	}
-	defer c.Client.PutResponse(resp)
-	if err != nil {
-		return internal.ErrorClientDo("statshouse.storeQueryTagValues", c.Network, c.ActorID, c.Address, err)
-	}
-	if ret != nil {
-		resp.Body, err = args.ReadResultTL1(resp.Body, ret)
-		if err != nil {
-			return internal.ErrorClientReadResult("statshouse.storeQueryTagValues", c.Network, c.ActorID, c.Address, err)
+			return internal.ErrorClientReadResult("statshouse.storeQuery", c.Network, c.ActorID, c.Address, err)
 		}
 	}
 	return nil
@@ -1072,28 +957,10 @@ type Handler struct {
 	// we use string as a crude logging capability. Agents write to log what they receive from aggregators.
 	// type of compressed_data should be checked by first 4 bytes (tag)
 	SendSourceBucket3 func(ctx context.Context, args SendSourceBucket3) (SendSourceBucket3Response, error) // statshouse.sendSourceBucket3
-	// The series verb. Covers every read surface that goes through buildSeriesQuery
-	// today — series, point queries, the table view, cardinality, PromQL series and
-	// the 1/sec cache-invalidation log query (a tag-only series query: empty `what`,
-	// group by tag1). what[] carries data_model.DigestSelector kinds; an empty
-	// what[] is legal and means "grouped tags and timestamps only". by[] carries
-	// grouped tag indices; format.ShardTagIndex (-3) is legal and is answered from
-	// shard_num, not from storage.
-	//
-	// Row limit semantics: the aggregator executes with LIMIT row_limit+1, because
-	// LIMIT N cannot distinguish "exactly N rows" from truncation. If the extra row
-	// appears the call FAILS with row_limit — a partial series result is never
-	// returned and never cached by the API.
-	StoreQuerySeries func(ctx context.Context, args StoreQuerySeries) (StoreSeriesResponse, error) // statshouse.storeQuerySeries
-	// The tag-values verb, covering both the values and the ids-only mode.
-	//
-	// CRITICAL: the aggregator MUST NOT apply the user's top-N. A value ranked below
-	// N on every individual shard can still be globally top-N once counts are
-	// summed, so per-shard top-N silently returns wrong answers. The aggregator
-	// returns ALL values up to row_limit (a safety cap, not the user's N) and fails
-	// on truncation; the API sums counts across shards and takes the global top N.
-	StoreQueryTagValues func(ctx context.Context, args StoreQueryTagValues) (StoreTagValuesResponse, error) // statshouse.storeQueryTagValues
-	TestConnection2     func(ctx context.Context, args TestConnection2) (string, error)                     // statshouse.testConnection2
+	// Runs one SELECT against the aggregator's duck-store. The API renders the
+	// SQL with the same builder it uses for ClickHouse.
+	StoreQuery      func(ctx context.Context, args StoreQuery) (StoreQueryResponse, error) // statshouse.storeQuery
+	TestConnection2 func(ctx context.Context, args TestConnection2) (string, error)        // statshouse.testConnection2
 
 	RawAddMetricsBatch        func(ctx context.Context, hctx *rpc.HandlerContext) error // statshouse.addMetricsBatch
 	RawAutoCreate             func(ctx context.Context, hctx *rpc.HandlerContext) error // statshouse.autoCreate
@@ -1106,8 +973,7 @@ type Handler struct {
 	RawSendKeepAlive2         func(ctx context.Context, hctx *rpc.HandlerContext) error // statshouse.sendKeepAlive2
 	RawSendKeepAlive3         func(ctx context.Context, hctx *rpc.HandlerContext) error // statshouse.sendKeepAlive3
 	RawSendSourceBucket3      func(ctx context.Context, hctx *rpc.HandlerContext) error // statshouse.sendSourceBucket3
-	RawStoreQuerySeries       func(ctx context.Context, hctx *rpc.HandlerContext) error // statshouse.storeQuerySeries
-	RawStoreQueryTagValues    func(ctx context.Context, hctx *rpc.HandlerContext) error // statshouse.storeQueryTagValues
+	RawStoreQuery             func(ctx context.Context, hctx *rpc.HandlerContext) error // statshouse.storeQuery
 	RawTestConnection2        func(ctx context.Context, hctx *rpc.HandlerContext) error // statshouse.testConnection2
 }
 
@@ -1521,77 +1387,40 @@ func (h *Handler) Handle(ctx context.Context, hctx *rpc.HandlerContext) (err err
 			}
 			return nil
 		}
-	case 0x57cb1008: // statshouse.storeQuerySeries
-		hctx.SetRequestFunctionName("statshouse.storeQuerySeries")
-		if h.RawStoreQuerySeries != nil && !hctx.BodyFormatTL2() {
+	case 0x57cb1011: // statshouse.storeQuery
+		hctx.SetRequestFunctionName("statshouse.storeQuery")
+		if h.RawStoreQuery != nil && !hctx.BodyFormatTL2() {
 			hctx.Request = r
-			err = h.RawStoreQuerySeries(ctx, hctx)
+			err = h.RawStoreQuery(ctx, hctx)
 			if hctx.LongpollStarted() || rpc.IsLongpollResponse(err) {
 				return err
 			}
 			if err != nil {
-				return internal.ErrorServerHandle("statshouse.storeQuerySeries", err)
+				return internal.ErrorServerHandle("statshouse.storeQuery", err)
 			}
 			return nil
 		}
-		if h.StoreQuerySeries != nil {
-			var args StoreQuerySeries
+		if h.StoreQuery != nil {
+			var args StoreQuery
 			if hctx.BodyFormatTL2() {
 				_, err = args.ReadTL2(r, nil)
 			} else {
 				_, err = args.ReadTL1(r)
 			}
 			if err != nil {
-				return internal.ErrorServerRead("statshouse.storeQuerySeries", err)
+				return internal.ErrorServerRead("statshouse.storeQuery", err)
 			}
 			ctx = hctx.WithContext(ctx)
-			ret, err := h.StoreQuerySeries(ctx, args)
+			ret, err := h.StoreQuery(ctx, args)
 			if err != nil {
-				return internal.ErrorServerHandle("statshouse.storeQuerySeries", err)
+				return internal.ErrorServerHandle("statshouse.storeQuery", err)
 			}
 			if hctx.LongpollStarted() {
 				return nil
 			}
 			hctx.Response, err = args.WriteResultTL1(hctx.Response, ret)
 			if err != nil {
-				return internal.ErrorServerWriteResult("statshouse.storeQuerySeries", err)
-			}
-			return nil
-		}
-	case 0x57cb1009: // statshouse.storeQueryTagValues
-		hctx.SetRequestFunctionName("statshouse.storeQueryTagValues")
-		if h.RawStoreQueryTagValues != nil && !hctx.BodyFormatTL2() {
-			hctx.Request = r
-			err = h.RawStoreQueryTagValues(ctx, hctx)
-			if hctx.LongpollStarted() || rpc.IsLongpollResponse(err) {
-				return err
-			}
-			if err != nil {
-				return internal.ErrorServerHandle("statshouse.storeQueryTagValues", err)
-			}
-			return nil
-		}
-		if h.StoreQueryTagValues != nil {
-			var args StoreQueryTagValues
-			if hctx.BodyFormatTL2() {
-				_, err = args.ReadTL2(r, nil)
-			} else {
-				_, err = args.ReadTL1(r)
-			}
-			if err != nil {
-				return internal.ErrorServerRead("statshouse.storeQueryTagValues", err)
-			}
-			ctx = hctx.WithContext(ctx)
-			ret, err := h.StoreQueryTagValues(ctx, args)
-			if err != nil {
-				return internal.ErrorServerHandle("statshouse.storeQueryTagValues", err)
-			}
-			if hctx.LongpollStarted() {
-				return nil
-			}
-			hctx.Response, err = args.WriteResultTL1(hctx.Response, ret)
-			if err != nil {
-				return internal.ErrorServerWriteResult("statshouse.storeQueryTagValues", err)
+				return internal.ErrorServerWriteResult("statshouse.storeQuery", err)
 			}
 			return nil
 		}
