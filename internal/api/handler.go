@@ -3100,7 +3100,7 @@ func loadPoints(ctx context.Context, h *requestHandler, pq *queryBuilder, lod da
 			cc.afterInflightLoadFinished(reqID)
 		}()
 	}
-	rows := 0
+	rows, truncated := 0, false
 	isFast := lod.IsFast()
 	isLight := query.isLight()
 	isHardware := query.isHardware()
@@ -3141,6 +3141,7 @@ func loadPoints(ctx context.Context, h *requestHandler, pq *queryBuilder, lod da
 				ret[ix] = append(ret[ix], row)
 			}
 			rows += block.Rows
+			truncated = truncated || block.Rows >= maxSeriesRows // one duck shard's answer is one block
 			return nil
 		}})
 	duration := time.Since(start)
@@ -3149,10 +3150,15 @@ func loadPoints(ctx context.Context, h *requestHandler, pq *queryBuilder, lod da
 		return 0, err
 	}
 
-	for ix := retStartIx; ix < len(ret); ix++ {
-		ret[ix] = mergeShardRows(h, ret[ix])
+	if h.shardMerge() {
+		for ix := retStartIx; ix < len(ret); ix++ {
+			ret[ix], _ = mergeShardRows(ret[ix], nil)
+			if pq.sort != sortNone {
+				sortLikeSQL(ret[ix], pq.by, pq.sort == sortDescending)
+			}
+		}
 	}
-	if rows == maxSeriesRows {
+	if rows == maxSeriesRows || truncated {
 		return rows, errTooManyRows // prevent cache being populated by incomplete data
 	}
 	if h.verbose {
@@ -3177,7 +3183,8 @@ func loadPoint(ctx context.Context, h *requestHandler, pq *queryBuilder, lod dat
 		return nil, err
 	}
 	ret := make([]pSelectRow, 0)
-	rows := 0
+	var times []int64
+	rows, truncated := 0, false
 	isFast := lod.IsFast()
 	isLight := query.isLight()
 	isHardware := query.isHardware()
@@ -3199,16 +3206,22 @@ func loadPoint(ctx context.Context, h *requestHandler, pq *queryBuilder, lod dat
 			for i := 0; i < block.Rows; i++ {
 				row := query.rowAtPoint(i)
 				ret = append(ret, row)
+				if h.shardMerge() {
+					times = append(times, query.time[i])
+				}
 			}
 			rows += block.Rows
+			truncated = truncated || block.Rows >= maxSeriesRows // one duck shard's answer is one block
 			return nil
 		}})
 	if err != nil {
 		return nil, err
 	}
 
-	ret = mergeShardRows(h, ret)
-	if rows == maxSeriesRows {
+	if h.shardMerge() {
+		ret = mergeShardPoints(ret, times)
+	}
+	if rows == maxSeriesRows || truncated {
 		return ret, errTooManyRows // prevent cache being populated by incomplete data
 	}
 	if h.verbose {

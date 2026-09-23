@@ -8,8 +8,11 @@ package api
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/ClickHouse/ch-go"
@@ -19,6 +22,7 @@ import (
 
 	"github.com/VKCOM/statshouse/internal/data_model/gen2/tlstatshouse"
 	"github.com/VKCOM/statshouse/internal/duckstore"
+	"github.com/VKCOM/statshouse/internal/format"
 )
 
 // duckShards reads metric data from the aggregators' duck-stores (see
@@ -83,28 +87,92 @@ func (d *duckShards) Select(ctx context.Context, query ch.Query) (time.Duration,
 	return time.Since(start), nil
 }
 
-// mergeShardRows folds rows of the same series into one: every row passed
-// shares the same time. A no-op unless several duck shards answered.
+// shardMerge reports whether rows of one series may come from several duck
+// shards and must be folded: the job a ClickHouse Distributed table does.
+func (h *requestHandler) shardMerge() bool {
+	return h.duck != nil && len(h.duck.clients) > 1
+}
+
+// mergeShardRows folds rows of the same series and time into one. times holds
+// each row's time, or is nil when all rows share one.
 func mergeShardRows[R any, P interface {
 	*R
 	parts() (*tsTags, *tsValues)
-}](h *requestHandler, rows []R) []R {
-	if h.duck == nil || len(h.duck.clients) < 2 || len(rows) < 2 {
-		return rows
+}](rows []R, times []int64) ([]R, []int64) {
+	type key struct {
+		time int64
+		tags tsTags
 	}
-	index := make(map[tsTags]int, len(rows))
-	res := rows[:0]
+	index := make(map[key]int, len(rows))
+	res, resTimes := rows[:0], times[:0]
 	for i := range rows {
-		tags, values := P(&rows[i]).parts()
-		if j, ok := index[*tags]; ok {
+		tags, _ := P(&rows[i]).parts()
+		k := key{tags: *tags}
+		if times != nil {
+			k.time = times[i]
+		}
+		if j, ok := index[k]; ok {
 			_, dst := P(&res[j]).parts()
-			dst.merge(*values)
+			_, src := P(&rows[i]).parts()
+			dst.merge(*src)
 			continue
 		}
-		index[*tags] = len(res)
+		index[k] = len(res)
 		res = append(res, rows[i])
+		if times != nil {
+			resTimes = append(resTimes, k.time)
+		}
+	}
+	return res, resTimes
+}
+
+// mergeShardPoints folds point rows of one series and time from several
+// shards and orders the result by time, so the point consumer, which keeps
+// the last row of a series, sees its latest bucket whatever the shard count.
+func mergeShardPoints(rows []pSelectRow, times []int64) []pSelectRow {
+	rows, times = mergeShardRows(rows, times)
+	order := make([]int, len(rows))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool { return times[order[a]] < times[order[b]] })
+	res := make([]pSelectRow, len(rows))
+	for i, j := range order {
+		res[i] = rows[j]
 	}
 	return res
+}
+
+// sortLikeSQL orders one time bucket's rows like the series SQL's ORDER BY
+// (grouped tags in order, the last column descending for sortDescending), which
+// pagination relies on once several shards' rows are merged.
+func sortLikeSQL(rows []tsSelectRow, by []int, desc bool) {
+	var cols []func(l, r *tsSelectRow) int // the ORDER BY columns after _time
+	for _, x := range by {
+		switch x {
+		case format.ShardTagIndex:
+			cols = append(cols, func(l, r *tsSelectRow) int { return cmp.Compare(l.shardNum, r.shardNum) })
+		default:
+			if x == format.StringTopTagIndex {
+				x = format.StringTopTagIndexV3
+			}
+			cols = append(cols,
+				func(l, r *tsSelectRow) int { return cmp.Compare(l.tag[x], r.tag[x]) },
+				func(l, r *tsSelectRow) int { return strings.Compare(l.stag[x], r.stag[x]) })
+		}
+	}
+	sort.SliceStable(rows, func(a, b int) bool {
+		for i, compare := range cols {
+			c := compare(&rows[a], &rows[b])
+			if desc && i == len(cols)-1 { // the SQL's DESC applies to the last column only
+				c = -c
+			}
+			if c != 0 {
+				return c < 0
+			}
+		}
+		return false
+	})
 }
 
 func (r *tsSelectRow) parts() (*tsTags, *tsValues) { return &r.tsTags, &r.tsValues }
