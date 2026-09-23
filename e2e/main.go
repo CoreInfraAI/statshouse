@@ -439,7 +439,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 		rec.logf("storage backend=duck: no ClickHouse container (DuckDB embedded in the aggregator)")
 	} else {
 		start := time.Now()
-		ch, err := startClickHouse(ctx, rt, chContainer, network, root)
+		ch, err := startClickHouse(ctx, rt, chContainer, network, root, artifactsDir)
 		containers = append(containers, chContainer)
 		if ch != nil && ch.ip != "" {
 			rec.logf("clickhouse container=%s ip=%s", chContainer, ch.ip)

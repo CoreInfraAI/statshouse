@@ -32,16 +32,23 @@ type clickHouse struct {
 }
 
 // startClickHouse brings up a single-node ClickHouse container with the committed
-// config.xml and de-replicated v6-init.sql mounted in, then waits for readiness.
-// repoRoot is the statshouse checkout root (where e2e/ lives).
-func startClickHouse(ctx context.Context, rt Runtime, container, network, repoRoot string) (*clickHouse, error) {
+// config.xml and the v6 schema (v6InitSQL, written to artifactsDir) mounted in,
+// then waits for readiness. repoRoot is the statshouse checkout root.
+func startClickHouse(ctx context.Context, rt Runtime, container, network, repoRoot, artifactsDir string) (*clickHouse, error) {
 	configPath := filepath.Join(repoRoot, "e2e", "clickhouse", "config.xml")
-	initPath := filepath.Join(repoRoot, "e2e", "clickhouse", "v6-init.sql")
 	usersPath := filepath.Join(repoRoot, "e2e", "clickhouse", "users.d", "default-user.xml")
-	for _, p := range []string{configPath, initPath, usersPath} {
+	for _, p := range []string{configPath, usersPath} {
 		if !fileExists(p) {
 			return nil, fmt.Errorf("missing committed ClickHouse asset %q", p)
 		}
+	}
+	initSQL, err := v6InitSQL(repoRoot)
+	if err != nil {
+		return nil, err
+	}
+	initPath := filepath.Join(artifactsDir, "v6-init.sql")
+	if err := os.WriteFile(initPath, []byte(initSQL), 0o644); err != nil {
+		return nil, err
 	}
 
 	opts := RunOpts{
@@ -178,4 +185,35 @@ func poll(ctx context.Context, timeout, interval time.Duration, fn func() (bool,
 func fileExists(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil
+}
+
+// v6InitSQL is the single-node form of the v6 cluster schema the localdebug
+// ClickHouse cluster uses: without ON CLUSTER and replication (there is no
+// Keeper), plus the aggregator's internal-log tables so its inserts land
+// instead of logging a 404 every few seconds.
+func v6InitSQL(repoRoot string) (string, error) {
+	b, err := os.ReadFile(filepath.Join(repoRoot, "localdebug", "clickhouse-cluster", "scripts", "v6-cluster-init.sql"))
+	if err != nil {
+		return "", fmt.Errorf("read the v6 schema: %w", err)
+	}
+	s := strings.NewReplacer(
+		" ON CLUSTER statlogs2", "",
+		"ON CLUSTER statlogs2 ", "",
+		"ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/{table}', '{replica}')", "AggregatingMergeTree",
+	).Replace(string(b))
+	if strings.Contains(s, "ON CLUSTER") || strings.Contains(s, "Replicated") {
+		return "", fmt.Errorf("the v6 schema changed shape: it still has cluster DDL after de-replication")
+	}
+	return s + `
+CREATE TABLE IF NOT EXISTS statshouse_internal_log
+(
+    time DateTime, host String, type String,
+    key0 String, key1 String, key2 String, key3 String, key4 String, key5 String,
+    message String
+)
+ENGINE = AggregatingMergeTree PARTITION BY toYYYYMM(time) ORDER BY (time, host, type, key0, key1, key2, key3, key4, key5);
+
+CREATE TABLE IF NOT EXISTS statshouse_internal_log_buffer AS statshouse_internal_log
+ENGINE = Buffer(default, statshouse_internal_log, 2, 120, 120, 10000000, 10000000, 100000000, 100000000);
+`, nil
 }
