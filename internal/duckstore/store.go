@@ -50,6 +50,10 @@ const (
 
 var errOverloaded = errors.New("duck-store: overloaded, every query slot stayed busy until the deadline")
 
+// maxResultBytes bounds a query's encoded columns: the answer travels in one
+// RPC packet (at most 16 MiB), and building a bigger one would only fail later.
+var maxResultBytes = 14 << 20
+
 type Store struct {
 	cfg  Config
 	db   *sql.DB
@@ -333,13 +337,18 @@ func readNative(ctx context.Context, conn *sql.Conn, query string) (rows int, co
 	for i := range vals {
 		ptrs[i] = &vals[i]
 	}
+	size := 0
 	for r.Next() {
 		if err := r.Scan(ptrs...); err != nil {
 			return 0, nil, err
 		}
 		for i, v := range vals {
+			n := len(cols[i])
 			if cols[i], err = appendNative(cols[i], v); err != nil {
 				return 0, nil, fmt.Errorf("duck-store: column %s: %w", types[i].Name(), err)
+			}
+			if size += len(cols[i]) - n; size > maxResultBytes {
+				return 0, nil, fmt.Errorf("duck-store: the result exceeds %d bytes after %d rows, narrow the query", maxResultBytes, rows)
 			}
 		}
 		rows++

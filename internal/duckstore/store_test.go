@@ -209,3 +209,13 @@ func TestStoreQueryRefusesAnythingButBuilderSelects(t *testing.T) {
 	_, err = s.db.Exec("SELECT * FROM read_text('" + secret + "')")
 	require.Error(t, err, "external access is disabled")
 }
+
+func TestStoreQueryRefusesOversizedResult(t *testing.T) {
+	s := openTestStore(t, t.TempDir(), Config{})
+	now := uint32(time.Now().Unix())
+	require.NoError(t, s.Insert(context.Background(), testBody(sampleRow(5, now, 1), sampleRow(5, now+1, 2))))
+	defer func(v int) { maxResultBytes = v }(maxResultBytes)
+	maxResultBytes = 20 // one row: 8 bytes of time + 8 of value
+	_, _, err := s.Query(context.Background(), "SELECT toInt64(time) AS _time, toFloat64(sum(count)) AS _val0 FROM statshouse_v6_1s_dist GROUP BY _time")
+	require.ErrorContains(t, err, "narrow the query")
+}

@@ -147,5 +147,7 @@ duck dialect that differs only where DuckDB cannot accept ClickHouse syntax
 aggregator creates views named after the ClickHouse tables and macros for the
 ClickHouse functions the builder calls, runs the SQL, and answers with the
 result in ClickHouse Native encoding, which the API decodes into the same
-columns it reads from ClickHouse. Agreement between the backends is checked by
+columns it reads from ClickHouse. An answer travels in one RPC packet, so a
+shard refuses a result over 14 MiB with an error asking to narrow the query,
+where ClickHouse would stream it. Agreement between the backends is checked by
 the e2e harness's differential conformance run (`go run ./e2e --conformance`).
