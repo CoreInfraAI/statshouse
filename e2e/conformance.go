@@ -136,7 +136,8 @@ func buildConformanceRequests(stream metricStream) []confRequest {
 	}
 
 	// Month-LOD series: the only step whose bucket timestamps depend on the
-	// timezone, so a zone bug shows up in the time axis alone.
+	// timezone, so a zone bug shows up in the time axis alone. The range starts
+	// a month early: a month point exists only where its start is in range.
 	if m, ok := confMetric(stream, "c_tagged"); ok {
 		reqs = append(reqs, confRequest{
 			kind:  confSeries,
@@ -145,6 +146,7 @@ func buildConformanceRequests(stream metricStream) []confRequest {
 			path: confQueryPath(m.Name, m.QBKeys, base, func(q url.Values) {
 				q.Set("qw", "count")
 				q.Set("w", "1M")
+				q.Set("f", strconv.FormatUint(uint64(base)-32*24*3600, 10))
 			}),
 		})
 	}
