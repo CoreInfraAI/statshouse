@@ -20,56 +20,20 @@
 #                                    # by side over one shared metadata, compared
 #                                    # by decoded value (CI gate; fails non-zero)
 #
-# Idempotent — create-once, run-many:
-#   • The VM is created on first run (downloads the Ubuntu image, ~1 GB) and
-#     reused on every later run; `limactl start` is a no-op when already running.
-#   • The guest toolchain (Go + build-essential) is installed only if missing.
-#   • The harness binary is rebuilt by `go build` (incremental) — a no-change
-#     rerun is near-instant.
-#   • Re-running after a --keep run prunes the kept stack: the harness removes
-#     every e2e-* container BEFORE it re-publishes the api port, so there is no
-#     "port already in use" collision, then starts a fresh stack.
+# Idempotent: the VM and the guest toolchain are created once and reused; the
+# harness binary is rebuilt incrementally.
 #
-# Design choices (documented per "document the choice in the header"):
-#
-#   • template:docker-rootful — the spec wrote `template://docker`, and Lima's
-#     `docker` template does install Docker, but it installs it ROOTLESS. Rootless
-#     Docker's bridge network lives in a private network namespace that the lima
-#     user's main namespace (where the harness process runs) cannot route to:
-#     a container can be UP and listening on 0.0.0.0:2442 yet a `nc -vz
-#     <container-ip> 2442` from the VM host still fails. The harness dials
-#     container IPs for EVERY readiness probe and inter-service wire (
-#     "all service wiring is by IP"), so rootless breaks it with no path-neutral
-#     harness fix. `docker-rootful` runs dockerd as a system service whose bridge
-#     sits in the VM's main network namespace, so container IPs ARE reachable
-#     from the host — identical to apple/container and to a real Linux box (which
-#     is what the spec's "On a real Linux box: plain `go run ./e2e`" assumes, a
-#     box that runs rootful Docker by default). The template grants the lima user
-#     access to the Docker socket (SocketUser override), so `docker` needs no
-#     sudo and auto-detection picks it without --runtime. This is the one
-#     documented deviation from the spec's literal `template://docker`; Lima also
-#     prints a deprecation hint for the `//` URL form, so the v2 canonical
-#     `template:` prefix is used.
-#
-#   • Go toolchain in the GUEST. The harness drives `go build` for the four
-#     daemons (build.go); that needs `go` on the guest PATH. The harness BINARY
-#     itself is cross-compiled on the Mac (known-good toolchain) and only the
-#     four daemons are built in the guest. build-essential covers the metadata
-#     daemon's CGO (sqlite amalgamation). Rejected alternative: cross-compiling
-#     the daemons on the Mac too and sharing them over the mount — the daemon
-#     cache lives under the guest $HOME, which differs from the Mac home, so it
-#     could not be pre-populated over the mount without harness changes (which
-#     are forbidden as path-specific behavior).
-#
-#   • Guest $HOME differs from the Mac. Lima v2 sets it to /home/<user>.guest
-#     (NOT the Mac home), so ~/.cache/statshouse-e2e (daemon + client build
-#     caches) is a fresh tree the first VM run populates: client repos re-clone
-#     (the guest has NAT network) and the daemons rebuild. Host and guest caches
-#     never mix, so a Mac run and a VM run cannot corrupt each other's cache.
-#
-#   • Guest published ports auto-forward to 127.0.0.1 on the Mac via Lima's
-#     built-in dynamic port forwarding, so while --keep is set a `curl
-#     http://127.0.0.1:10888/...` from the Mac reaches the api container.
+# Design notes:
+#   • template:docker-rootful, not the rootless `docker` template: the harness
+#     dials container IPs for every probe and wire, and rootless Docker's bridge
+#     lives in a network namespace the VM host cannot route to.
+#   • Go runs in the guest because the harness builds the daemons with `go
+#     build` (the metadata daemon needs CGO for sqlite, hence build-essential);
+#     the harness binary itself is cross-compiled on the Mac.
+#   • The guest $HOME differs from the Mac's, so the guest keeps its own
+#     ~/.cache/statshouse-e2e build caches.
+#   • Published guest ports are forwarded to 127.0.0.1 on the Mac, so with
+#     --keep `curl http://127.0.0.1:10888/...` reaches the api.
 #
 set -euo pipefail
 

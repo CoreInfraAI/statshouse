@@ -55,15 +55,12 @@ build-agg:
 # Aggregator with the DuckDB storage backend embedded (the "duckdb" build tag).
 # Not part of build-go: the default build stays pure Go.
 #
-# On linux the DuckDB binary must be fully static, and a naive -static link
-# segfaults on first connector creation: under glibc < 2.34 libstdc++ probes
-# weak pthread symbols at startup, and only the pthread archive members that
-# resolved some reference get linked in, so DuckDB's task scheduler ends up
-# with no-op mutexes. Whole-archiving libpthread.a fixes it; the duplicate
-# members that Go's own -lpthread already pulled in are byte-identical, so
-# --allow-multiple-definition is safe here. Verified recipe, see
-# .scratch/duck-store/02-cgo-build-research.md. On darwin the platform
-# toolchain links as usual and none of this applies.
+# On linux the binary must be fully static, and a naive -static link segfaults
+# on first use: libstdc++ probes weak pthread symbols, and only the libpthread.a
+# members that resolved some reference get linked, leaving DuckDB's scheduler
+# with no-op mutexes. Whole-archiving libpthread.a fixes it; its duplicates of
+# what Go's -lpthread pulled in are identical, so --allow-multiple-definition is
+# safe.
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Linux)
 DUCKDB_LIBPTHREAD := $(shell $(CC) -print-file-name=libpthread.a)
@@ -73,12 +70,9 @@ DUCKDB_LIBPTHREAD :=
 DUCKDB_EXTLDFLAGS := -O2
 endif
 
-# osusergo is load-bearing for the static Linux link: a statically-linked
-# glibc cannot dlopen its NSS modules, so the cgo group lookup behind
-# ChangeUserGroup fails and the daemon dies at startup whenever it starts as
-# root with --user/--group (the standard daemon start shape). osusergo makes
-# os/user read /etc/passwd and /etc/group directly instead. The e2e harness
-# builds its duck aggregator with the same tag for exactly this reason.
+# osusergo: a static glibc cannot load NSS modules, so the user/group lookup
+# behind --user/--group would fail at startup; osusergo reads /etc/passwd and
+# /etc/group directly.
 build-agg-duckdb:
 ifneq ($(DUCKDB_LIBPTHREAD),)
 	@test "$(DUCKDB_LIBPTHREAD)" != "libpthread.a" || { echo 'ERROR: $(CC) -print-file-name=libpthread.a echoed the argument back (no libpthread.a in the toolchain?) — the static duckdb build needs a complete toolchain' >&2; exit 1; }
