@@ -20,37 +20,18 @@ import (
 	"github.com/VKCOM/tl/pkg/rpc"
 
 	"github.com/VKCOM/statshouse/internal/data_model/gen2/tlstatshouse"
+	"github.com/VKCOM/statshouse/internal/duckstore"
 )
 
-// storageBackend names the metric-data backend a run drives.
-type storageBackend string
+// storageBackend names the metric-data backend a run drives: clickhouse (a
+// ClickHouse container plus the four daemons pointed at it) or duck (the
+// duckdb-tagged aggregator is the storage; no ClickHouse container).
+type storageBackend = duckstore.StorageBackend
 
 const (
-	// backendClickHouse is the default stack: a ClickHouse container plus the
-	// four daemons pointed at it.
-	backendClickHouse storageBackend = "clickhouse"
-	// backendDuck runs the aggregator with DuckDB embedded (the duckdb
-	// build-tagged binary): no ClickHouse container, the aggregator serves
-	// store queries on its own second address, and the api fans every query
-	// out to it over the structured query RPC.
-	backendDuck storageBackend = "duck"
+	backendClickHouse = duckstore.BackendClickHouse
+	backendDuck       = duckstore.BackendDuck
 )
-
-// parseStorageBackend resolves the --storage-backend flag. An empty value (the
-// flag's default) selects clickhouse; anything but the two known names is a
-// hard error naming the flag and both choices.
-func parseStorageBackend(v string) (storageBackend, error) {
-	switch v {
-	case "":
-		return backendClickHouse, nil
-	case string(backendClickHouse):
-		return backendClickHouse, nil
-	case string(backendDuck):
-		return backendDuck, nil
-	default:
-		return "", fmt.Errorf("unknown --storage-backend %q (want %q or %q)", v, backendClickHouse, backendDuck)
-	}
-}
 
 // daemonSpecsFor returns the daemons to cross-compile for a backend. The two
 // backends differ in exactly one daemon: under duck the aggregator is built

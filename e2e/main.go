@@ -47,7 +47,7 @@ func main() {
 		runtimeFlag     = flag.String("runtime", "", "container runtime: \"container\" (apple, default on macOS) or \"docker\" (default on Linux); auto-detected if empty")
 		runIDFlag       = flag.String("run-id", "", "run identifier (default: local datetime 20060102-150405)")
 		archFlag        = flag.String("arch", "", "GOARCH to cross-compile daemons for (default arm64; the apple/container + lima/arm64 verification path)")
-		backendFlag     = flag.String("storage-backend", "clickhouse", "storage backend the daemons run: \"clickhouse\" (default; the usual stack) or \"duck\" (DuckDB embedded in the aggregator; no ClickHouse container, the api reads through the aggregator's store-query RPC)")
+		backend         storageBackend
 		keep            = flag.Bool("keep", false, "keep containers+network after the run for debugging")
 		verbose         = flag.Bool("v", false, "verbose: stream container logs live and dump raw API responses to artifacts")
 		timeout         = flag.Duration("timeout", 10*time.Minute, "overall run timeout")
@@ -59,13 +59,8 @@ func main() {
 		clientSel       clientFlag
 	)
 	flag.Var(&clientSel, "client", "client(s) to drive (repeatable; one of: go, rust, cpp). Default: all three")
+	flag.Var(&backend, "storage-backend", "storage backend the daemons run: \"clickhouse\" (default; the usual stack) or \"duck\" (DuckDB embedded in the aggregator; no ClickHouse container, the api reads through the aggregator's RPC)")
 	flag.Parse()
-
-	backend, err := parseStorageBackend(*backendFlag)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "FAIL: %v\n", err)
-		os.Exit(2)
-	}
 	if *conformance {
 		// Conformance compares the ch and duck backends side by side, so its
 		// CH stack must run on ClickHouse (the duck stack is started

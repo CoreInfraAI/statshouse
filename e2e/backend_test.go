@@ -17,40 +17,6 @@ import (
 	"testing"
 )
 
-func TestParseStorageBackend(t *testing.T) {
-	cases := []struct {
-		in      string
-		want    storageBackend
-		wantErr bool
-	}{
-		{"", backendClickHouse, false}, // flag default
-		{"clickhouse", backendClickHouse, false},
-		{"duck", backendDuck, false},
-		{"CH", "", true},
-		{"Duck", "", true},
-		{"duckdb", "", true}, // the build tag is not a backend name
-		{"postgres", "", true},
-	}
-	for _, c := range cases {
-		got, err := parseStorageBackend(c.in)
-		if c.wantErr {
-			if err == nil {
-				t.Errorf("parseStorageBackend(%q) = %q, want an error", c.in, got)
-			} else if !strings.Contains(err.Error(), "--storage-backend") || !strings.Contains(err.Error(), "duck") || !strings.Contains(err.Error(), "clickhouse") {
-				t.Errorf("parseStorageBackend(%q) error %q must name the flag and both choices", c.in, err)
-			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("parseStorageBackend(%q) unexpected error: %v", c.in, err)
-			continue
-		}
-		if got != c.want {
-			t.Errorf("parseStorageBackend(%q) = %q, want %q", c.in, got, c.want)
-		}
-	}
-}
-
 // TestDaemonSpecsFor pins the per-backend build list: clickhouse builds the
 // usual four (one cgo daemon: metadata), duck swaps only the aggregator for
 // the duckdb-tagged static-cgo build cached under its own name, and the other
