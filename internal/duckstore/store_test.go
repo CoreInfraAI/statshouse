@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -148,4 +149,29 @@ func TestStoreQueryAdmission(t *testing.T) {
 	rows, _, err := s.Query(context.Background(), "SELECT 1::INTEGER")
 	require.NoError(t, err)
 	require.Equal(t, 1, rows)
+}
+
+// A transaction whose COMMIT never ran (its context died first) must not leave
+// the writer inside it: the next insert has to commit, and the abandoned rows
+// must not appear.
+func TestStoreInsertRecoversFromAbandonedCommit(t *testing.T) {
+	s := openTestStore(t, t.TempDir(), Config{})
+	ctx, cancel := context.WithCancel(context.Background())
+	err := inTx(ctx, s.writer, "BEGIN", func() error {
+		_, err := s.writer.ExecContext(ctx, "INSERT INTO rows_1s SELECT * FROM rows_1s")
+		cancel()
+		return err
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	now := uint32(time.Now().Unix())
+	require.NoError(t, s.Insert(context.Background(), testBody(sampleRow(5, now, 1))))
+	for _, table := range []string{"rows_1s", "rows_1m", "rows_1h"} {
+		require.Equal(t, 1, s.countRows(t, table))
+	}
+
+	// a writer the store had to discard is replaced on the next insert
+	_ = s.writer.Raw(func(any) error { return driver.ErrBadConn })
+	require.Error(t, s.Insert(context.Background(), testBody(sampleRow(5, now, 1))))
+	require.NoError(t, s.Insert(context.Background(), testBody(sampleRow(5, now, 1))))
+	require.Equal(t, 2, s.countRows(t, "rows_1s"))
 }

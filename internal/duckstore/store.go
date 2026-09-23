@@ -163,7 +163,9 @@ func (s *Store) init() (err error) {
 func (s *Store) Close() error {
 	close(s.stop)
 	<-s.done
-	_ = s.writer.Close()
+	if s.writer != nil {
+		_ = s.writer.Close()
+	}
 	return s.db.Close()
 }
 
@@ -176,7 +178,13 @@ func (s *Store) Insert(ctx context.Context, body []byte) error {
 	for i := range buckets {
 		buckets[i] = map[int64]struct{}{}
 	}
-	err := inTx(ctx, s.writer, func() error {
+	if s.writer == nil {
+		var err error
+		if s.writer, err = s.db.Conn(ctx); err != nil {
+			return err
+		}
+	}
+	err := inTx(ctx, s.writer, "BEGIN", func() error {
 		return s.writer.Raw(func(dc any) error {
 			var apps []*duckdb.Appender
 			var err error
@@ -221,6 +229,9 @@ func (s *Store) Insert(ctx context.Context, body []byte) error {
 		})
 	})
 	if err != nil {
+		if s.writer.PingContext(context.Background()) != nil { // discarded by inTx
+			s.writer = nil
+		}
 		return err
 	}
 	now := time.Now()
@@ -244,18 +255,26 @@ func closed(bucket int64, t tier, now time.Time) bool {
 	return bucket+t.seconds+int64(closeGrace/time.Second) <= now.Unix()
 }
 
-// inTx runs fn inside an explicit transaction on conn. It is issued through
-// the connection rather than sql.Tx because a duckdb.Appender cannot take part
-// in an sql.Tx.
-func inTx(ctx context.Context, conn *sql.Conn, fn func() error) error {
-	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
+// inTx runs fn inside an explicit transaction on conn, begun with begin. It is
+// issued through the connection rather than sql.Tx because a duckdb.Appender
+// cannot take part in an sql.Tx. Every failure, a failed COMMIT included, rolls
+// back; a connection whose transaction cannot be ended would fail every later
+// BEGIN, so it is discarded instead of going back to the pool.
+func inTx(ctx context.Context, conn *sql.Conn, begin string, fn func() error) error {
+	if _, err := conn.ExecContext(ctx, begin); err != nil {
 		return err
 	}
-	if err := fn(); err != nil {
-		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
-		return err
+	err := fn()
+	if err == nil {
+		if _, err = conn.ExecContext(ctx, "COMMIT"); err == nil {
+			return nil
+		}
 	}
-	_, err := conn.ExecContext(ctx, "COMMIT")
+	cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, rerr := conn.ExecContext(cleanup, "ROLLBACK"); rerr != nil {
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn }) // closes the physical connection
+	}
 	return err
 }
 
@@ -383,7 +402,7 @@ func (s *Store) compact(ctx context.Context, conn *sql.Conn) error {
 		s.mu.Unlock()
 		for len(due) != 0 {
 			batch := due[:min(len(due), collapseBatchMax)]
-			err := inTx(ctx, conn, func() error {
+			err := inTx(ctx, conn, "BEGIN", func() error {
 				for _, stmt := range collapseSQL(t.table, strings.Join(batch, ",")) {
 					if _, err := conn.ExecContext(ctx, stmt); err != nil {
 						return err
