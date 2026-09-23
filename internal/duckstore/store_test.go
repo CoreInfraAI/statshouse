@@ -219,3 +219,49 @@ func TestStoreQueryRefusesOversizedResult(t *testing.T) {
 	_, _, err := s.Query(context.Background(), "SELECT toInt64(time) AS _time, toFloat64(sum(count)) AS _val0 FROM statshouse_v6_1s_dist GROUP BY _time")
 	require.ErrorContains(t, err, "narrow the query")
 }
+
+// Rows left uncollapsed before a restart, however old, are found and
+// collapsed: the dirty set does not survive a restart.
+func TestStoreCollapsesAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	ts := uint32(time.Now().Add(-24 * time.Hour).Unix())
+	s, err := Open(Config{Dir: dir})
+	require.NoError(t, err)
+	for range 2 {
+		require.NoError(t, s.Insert(context.Background(), testBody(sampleRow(5, ts, 1))))
+	}
+	require.NoError(t, s.Close())
+
+	s = openTestStore(t, dir, Config{})
+	for _, table := range []string{"rows_1s", "rows_1m", "rows_1h"} {
+		require.Equal(t, 2, s.countRows(t, table))
+	}
+	s.runPass(t, s.compact)
+	for _, table := range []string{"rows_1s", "rows_1m", "rows_1h"} {
+		require.Equal(t, 1, s.countRows(t, table), table)
+	}
+}
+
+// A bucket that cannot be collapsed (here: a corrupt aggregate state) stays
+// dirty for the next pass without holding back the other buckets.
+func TestStoreCollapseIsolatesFailingBucket(t *testing.T) {
+	s := openTestStore(t, t.TempDir(), Config{})
+	good, bad := time.Now().Add(-2*time.Hour).Unix()/60*60, time.Now().Add(-3*time.Hour).Unix()/60*60
+	for range 2 {
+		require.NoError(t, s.Insert(context.Background(), testBody(sampleRow(5, uint32(good), 1), sampleRow(5, uint32(bad), 1))))
+	}
+	_, err := s.db.Exec("UPDATE rows_1m SET percentiles = '\\x05'::BLOB WHERE time = ?", bad)
+	require.NoError(t, err)
+	conn, err := s.db.Conn(context.Background())
+	require.NoError(t, err)
+	defer conn.Close()
+	require.Error(t, s.compact(context.Background(), conn))
+	var n int
+	require.NoError(t, s.db.QueryRow("SELECT count(*) FROM rows_1m WHERE time = ?", good).Scan(&n))
+	require.Equal(t, 1, n, "the good bucket collapsed")
+	require.NoError(t, s.db.QueryRow("SELECT count(*) FROM rows_1m WHERE time = ?", bad).Scan(&n))
+	require.Equal(t, 2, n, "the failing bucket is left as it was")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	require.Equal(t, 2, s.dirty[1][bad], "and retried on the next pass")
+}

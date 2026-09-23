@@ -45,7 +45,11 @@ const (
 	// closeGrace is how long past its end a bucket may still receive the
 	// conveyor's regular (non-historic) inserts; it is collapsed after that.
 	closeGrace       = 10 * time.Second
-	collapseBatchMax = 1000
+	collapseBatchMax = 100
+	// reconcileChunk is how many buckets of a tier one compaction pass checks
+	// for rows left uncollapsed before the process started.
+	reconcileChunk = 3600
+	reconcileDone  = math.MaxInt64
 )
 
 var errOverloaded = errors.New("duck-store: overloaded, every query slot stayed busy until the deadline")
@@ -66,8 +70,14 @@ type Store struct {
 	dirty    [3]map[int64]int // per tier: bucket start -> insert rounds since its last collapse
 	lastPass [2]time.Time     // last successful compaction, retention
 
-	stop chan struct{}
-	done chan struct{}
+	// The dirty set lives in memory: buckets before startUnix are checked
+	// for uncollapsed rows by reconcile, reconcileNext[tier] at a time.
+	startUnix     int64
+	reconcileNext [3]int64 // owned by the maintenance goroutine; 0: not started
+
+	ctx    context.Context // canceled by Close, stops maintenance
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // Open opens (creating if needed) the store in cfg.Dir and starts its
@@ -103,23 +113,21 @@ func Open(cfg Config) (*Store, error) {
 			return nil, err
 		}
 	}
-	s := &Store{cfg: cfg, db: db, sema: make(chan struct{}, cfg.QueryConcurrency), stop: make(chan struct{}), done: make(chan struct{})}
+	s := &Store{cfg: cfg, db: db, sema: make(chan struct{}, cfg.QueryConcurrency)}
+	s.ctx, s.cancel = context.WithCancel(context.Background())
 	if err := s.init(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	now := time.Now()
 	s.lastPass = [2]time.Time{now, now}
+	s.startUnix = now.Unix()
 	for i := range s.dirty {
 		s.dirty[i] = map[int64]int{}
 	}
-	// a restart forgets which buckets hold uncollapsed rows: revisit the recent coarse ones
-	for i, t := range tiers[1:] {
-		for b := now.Add(-2 * time.Hour).Unix(); b < now.Unix(); b += t.seconds {
-			s.dirty[i+1][b-b%t.seconds] = 2
-		}
-	}
+	s.wg.Add(2)
 	go s.maintain()
+	go s.sampleLoop()
 	return s, nil
 }
 
@@ -167,8 +175,8 @@ func (s *Store) init() (err error) {
 
 // Close stops maintenance and closes the file.
 func (s *Store) Close() error {
-	close(s.stop)
-	<-s.done
+	s.cancel()
+	s.wg.Wait()
 	if s.writer != nil {
 		_ = s.writer.Close()
 	}
@@ -379,21 +387,33 @@ func appendNative(buf []byte, v any) ([]byte, error) {
 }
 
 func (s *Store) maintain() {
-	defer close(s.done)
+	defer s.wg.Done()
 	compact := time.NewTicker(compactInterval)
 	retain := time.NewTicker(retainInterval)
-	sample := time.NewTicker(sampleInterval)
 	defer compact.Stop()
 	defer retain.Stop()
-	defer sample.Stop()
 	for {
 		select {
-		case <-s.stop:
+		case <-s.ctx.Done():
 			return
 		case <-compact.C:
 			s.pass(0, format.TagValueIDDuckMaintenanceCompaction, s.compact)
 		case <-retain.C:
 			s.pass(1, format.TagValueIDDuckMaintenanceRetention, s.retain)
+		}
+	}
+}
+
+// sampleLoop reports the store's gauges independently of maintenance, so a
+// stuck pass shows as a growing maintenance age.
+func (s *Store) sampleLoop() {
+	defer s.wg.Done()
+	sample := time.NewTicker(sampleInterval)
+	defer sample.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
 		case <-sample.C:
 			s.sample()
 		}
@@ -402,10 +422,9 @@ func (s *Store) maintain() {
 
 func (s *Store) pass(i int, kind int32, fn func(context.Context, *sql.Conn) error) {
 	start := time.Now()
-	ctx := context.Background()
-	conn, err := s.db.Conn(ctx)
+	conn, err := s.db.Conn(s.ctx)
 	if err == nil {
-		err = fn(ctx, conn)
+		err = fn(s.ctx, conn)
 		_ = conn.Close()
 	}
 	if err != nil {
@@ -420,14 +439,15 @@ func (s *Store) pass(i int, kind int32, fn func(context.Context, *sql.Conn) erro
 
 // compact collapses every closed bucket that received more than one round.
 func (s *Store) compact(ctx context.Context, conn *sql.Conn) error {
+	errs := []error{s.reconcile(ctx, conn)}
 	now := time.Now()
 	for i, t := range tiers {
-		var due []string
+		var due []int64
 		s.mu.Lock()
 		for b, n := range s.dirty[i] {
 			if closed(b, t, now) {
 				if n > 1 {
-					due = append(due, strconv.FormatInt(b, 10))
+					due = append(due, b)
 				}
 				delete(s.dirty[i], b)
 			}
@@ -435,24 +455,89 @@ func (s *Store) compact(ctx context.Context, conn *sql.Conn) error {
 		s.mu.Unlock()
 		for len(due) != 0 {
 			batch := due[:min(len(due), collapseBatchMax)]
-			err := inTx(ctx, conn, "BEGIN", func() error {
-				for _, stmt := range collapseSQL(t.table, strings.Join(batch, ",")) {
-					if _, err := conn.ExecContext(ctx, stmt); err != nil {
-						return err
-					}
-				}
-				return nil
-			})
-			if err != nil {
-				s.mu.Lock()
-				for _, b := range due { // retry on the next pass
-					ts, _ := strconv.ParseInt(b, 10, 64)
-					s.dirty[i][ts] = max(s.dirty[i][ts], 2)
-				}
-				s.mu.Unlock()
-				return fmt.Errorf("collapse %s: %w", t.table, err)
-			}
+			errs = append(errs, s.collapse(ctx, conn, i, batch))
 			due = due[len(batch):]
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// collapse folds buckets of tier i in one transaction. A failing batch is
+// split until the failing buckets are isolated: they stay dirty for the next
+// pass while the rest collapse.
+func (s *Store) collapse(ctx context.Context, conn *sql.Conn, i int, buckets []int64) error {
+	list := make([]string, len(buckets))
+	for j, b := range buckets {
+		list[j] = strconv.FormatInt(b, 10)
+	}
+	err := inTx(ctx, conn, "BEGIN", func() error {
+		for _, stmt := range collapseSQL(tiers[i].table, strings.Join(list, ",")) {
+			if _, err := conn.ExecContext(ctx, stmt); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err == nil {
+		return nil
+	}
+	if len(buckets) == 1 || ctx.Err() != nil || conn.PingContext(ctx) != nil {
+		s.markDirty(i, buckets)
+		return fmt.Errorf("collapse %s buckets %v: %w", tiers[i].table, buckets, err)
+	}
+	half := len(buckets) / 2
+	return errors.Join(s.collapse(ctx, conn, i, buckets[:half]), s.collapse(ctx, conn, i, buckets[half:]))
+}
+
+func (s *Store) markDirty(i int, buckets []int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, b := range buckets {
+		s.dirty[i][b] = max(s.dirty[i][b], 2)
+	}
+}
+
+// reconcile checks, one chunk per tier and pass, the buckets written before
+// this process started for rows sharing a key, and marks them dirty: the dirty
+// set is kept in memory and a restart forgets it.
+func (s *Store) reconcile(ctx context.Context, conn *sql.Conn) error {
+	for i, t := range tiers {
+		from := s.reconcileNext[i]
+		if from == reconcileDone {
+			continue
+		}
+		if from == 0 {
+			var first sql.NullInt64
+			if err := conn.QueryRowContext(ctx, "SELECT min(time) FROM "+t.table).Scan(&first); err != nil {
+				return err
+			}
+			if !first.Valid {
+				s.reconcileNext[i] = reconcileDone
+				continue
+			}
+			from = first.Int64
+		}
+		to := min(from+reconcileChunk*t.seconds, s.startUnix+1)
+		rows, err := conn.QueryContext(ctx, "SELECT time FROM "+t.table+" WHERE time >= ? AND time < ? GROUP BY time HAVING count(*) > count(DISTINCT hash("+strings.Join(keyColumns, ", ")+"))", from, to)
+		if err != nil {
+			return err
+		}
+		var found []int64
+		for rows.Next() {
+			var b int64
+			if err := rows.Scan(&b); err != nil {
+				rows.Close()
+				return err
+			}
+			found = append(found, b)
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return err
+		}
+		s.markDirty(i, found)
+		s.reconcileNext[i] = to
+		if to > s.startUnix {
+			s.reconcileNext[i] = reconcileDone
 		}
 	}
 	return nil
@@ -473,7 +558,9 @@ func (s *Store) retain(ctx context.Context, conn *sql.Conn) error {
 
 func (s *Store) sample() {
 	var blockSize, used, free int64
-	err := s.db.QueryRow("SELECT block_size, used_blocks, free_blocks FROM pragma_database_size() WHERE database_name = current_database()").Scan(&blockSize, &used, &free)
+	ctx, cancel := context.WithTimeout(s.ctx, sampleInterval)
+	defer cancel()
+	err := s.db.QueryRowContext(ctx, "SELECT block_size, used_blocks, free_blocks FROM pragma_database_size() WHERE database_name = current_database()").Scan(&blockSize, &used, &free)
 	if err == nil {
 		s.record(format.BuiltinMetricMetaDuckStoreSize, float64(blockSize*used), format.TagValueIDDuckSizeUsed)
 		s.record(format.BuiltinMetricMetaDuckStoreSize, float64(blockSize*free), format.TagValueIDDuckSizeFree)

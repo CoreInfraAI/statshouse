@@ -85,7 +85,9 @@ are; compaction only saves space. Every 10 seconds it collapses, in place, each
 time bucket that has closed and received more than one insert round — the
 1m and 1h buckets once they end, and 1s buckets that historic inserts wrote
 again — the way AggregatingMergeTree merges parts. DuckDB's MVCC keeps
-queries, inserts and compaction from blocking each other.
+queries, inserts and compaction from blocking each other. Which buckets need
+collapsing is tracked in memory; after a restart compaction scans the store a
+chunk per pass and collapses whatever an earlier process left behind.
 
 ## Retention and disk
 
