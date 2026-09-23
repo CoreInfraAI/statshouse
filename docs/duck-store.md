@@ -148,6 +148,29 @@ Ingestion status and the other builtin metrics flow through the duck write
 path unchanged; the aggregator's internal log, which under ClickHouse goes to
 a log table, is written to the process log.
 
+## Known limitations
+
+- **Memory of aggregate-state merges.** Percentile, unique and host states
+  are merged by Go functions over `list(...)` of the states of a group, so a
+  query or a compaction batch holds all input states of a group at once, and
+  that memory is not bounded by `--duck-memory-limit`. A unique query over
+  many large states can use far more memory than the limit.
+- **Cardinality of recent buckets.** Cardinality counts stored rows, as under
+  ClickHouse, and a 1m or 1h bucket is collapsed only after it closes, so the
+  current minute's and hour's cardinality counts insert rounds until then
+  (ClickHouse's background merges shrink this sooner).
+- **Point queries** return a series' latest bucket in the range, not the
+  aggregate over it — the same as under ClickHouse.
+
+## Changes shared with ClickHouse
+
+Three fixes on this branch touch code the ClickHouse path shares: point
+queries no longer crash on mapped tags and now carry string tags and the
+shard number (`rowAtPoint`); merging uniq states screens items with the
+target's filter (`ChUnique`); an empty argMin/argMax host state no longer
+replaces a valid host when states are merged. `loadgen` honours
+`STATSHOUSE_API_URL`.
+
 ## How reads work
 
 The API renders a query with the same builder it uses for ClickHouse, in a

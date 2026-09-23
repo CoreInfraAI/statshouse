@@ -12,6 +12,10 @@ down through the existing sampling budget rather than by provisioning more.
 
 ## Consequences
 
+The memory limit bounds DuckDB's own operators, not the aggregate-state merges, which hold a group's
+input states at once (see the operator guide's known limitations); bounding those needs folds that
+consume states incrementally.
+
 Under sustained load duck-store refuses queries as overloaded where a tuned-to-the-box configuration
 would have served them. That is the intended trade: predictable small resident cost over peak
 throughput. Any benchmark that concludes "duck-store is slower than it could be" should check whether
