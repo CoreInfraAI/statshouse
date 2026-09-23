@@ -5,31 +5,12 @@ import (
 	"sort"
 )
 
-// This file holds the PURE logic shared between the harness's expected model
-// and the deterministic generator loops emitted into every client driver
-// (a "pinned seed": one deterministic formula, not per-language RNG):
-//
-//   - quantile: the TRUE quantile the value_p percentile assertions compare the
-//     t-digest's output against, using the SAME linear-interpolation definition
-//     (NumPy "linear" / R type 7) the t-digest itself approximates.
-//   - genValueUniform / genValueSkewed / genUniqueDistinct: the exact value and
-//     unique sequences the driver loops reproduce. They are bit-identical across
-//     Go (harness), Rust, and C++ because they use only unsigned-64 wrapping
-//     integer arithmetic and a single float multiply/divide.
-//   - withinAbsTol / withinRelTol: the tolerance-band checks the percentile and
-//     unique assertions use.
-//
-// Everything here is deterministic and side-effect-free → unit-tested
-// (quantile_test.go).
+// Deterministic generators and true-quantile math shared by the expected model
+// and the client drivers. The generators are bit-identical across Go, Rust and
+// C++: they use only uint64 wrapping arithmetic and one float multiply/divide.
 
-// lcgMul / lcgAdd / lcgSeed are the Knuth MMIX LCG constants (also PCG's
-// multiplier). The skewed-distribution generator advances a uint64 state with
-// `x = x*lcgMul + lcgAdd` (mod 2^64). Go wraps uint64 implicitly; each driver
-// template carries the exact same constants as numeric literals (wrapping_mul /
-// wrapping_add in Rust, ULL overflow — defined to wrap for unsigned — in C++).
-// The three copies are pinned to these by TestDriverLCGIdentity, which renders
-// each template and asserts the seed/mul/add tokens derived here appear verbatim,
-// so a unilateral edit in either direction fails the test.
+// lcgMul / lcgAdd / lcgSeed are the Knuth MMIX LCG constants. Each driver
+// template repeats them as literals; TestDriverLCGIdentity pins the copies.
 const (
 	lcgMul  uint64 = 6364136223846793005
 	lcgAdd  uint64 = 1442695040888963407
@@ -43,16 +24,9 @@ const (
 	skewedScale = 1000.0
 )
 
-// quantile returns the q-quantile (0≤q≤1) of an ALREADY SORTED slice using
-// linear interpolation between the two bracketing order statistics — NumPy's
-// default "linear" method, R type 7, and the definition the t-digest
-// approximates (hrissan/tdigest Quantile does weighted-linear interpolation
-// between adjacent centroid means). An empty input yields NaN so a caller bug
-// surfaces rather than silently comparing against 0.
-//
-// The harness sorts the merged per-bucket values once at generation time and
-// passes the sorted slice here; the assertions compare the API's t-digest
-// result to this value within a tolerance (withinAbsTol).
+// quantile returns the q-quantile of an already sorted slice by linear
+// interpolation (NumPy "linear", R type 7), the definition the t-digest
+// approximates. Empty input yields NaN so a caller bug surfaces.
 func quantile(sorted []float64, q float64) float64 {
 	n := len(sorted)
 	if n == 0 {
@@ -76,16 +50,14 @@ func quantile(sorted []float64, q float64) float64 {
 	return sorted[lo] + frac*(sorted[lo+1]-sorted[lo])
 }
 
-// quantileOf sorts a copy of values and returns its q-quantile. Use when the
-// input is not already sorted (the skewed LCG sequence is not).
+// quantileOf sorts a copy of values and returns its q-quantile.
 func quantileOf(values []float64, q float64) float64 {
 	cp := append([]float64(nil), values...)
 	sort.Float64s(cp)
 	return quantile(cp, q)
 }
 
-// genValueUniform returns {0, 1, ..., n-1} — the "0–999 step 1" uniform
-// distribution generalised to n points. Already sorted.
+// genValueUniform returns {0, 1, ..., n-1}, already sorted.
 func genValueUniform(n int) []float64 {
 	out := make([]float64, n)
 	for i := 0; i < n; i++ {
@@ -94,16 +66,8 @@ func genValueUniform(n int) []float64 {
 	return out
 }
 
-// genValueSkewed returns n values from a deterministic, skewed distribution
-// built from the shared LCG. Each step: advance the LCG, take the top 32 bits
-// mod skewedRange (0..999), emit r*r/skewedScale. The density is ∝ 1/√v, so
-// mass concentrates near 0 (true p50≈¼·range, p99≈⅘·range²-ish) — clearly
-// distinct from the uniform case, exercising the t-digest on a non-uniform
-// population. The output is NOT sorted; quantileOf sorts a copy.
-//
-// Bit-identity across languages hinges on: uint64 wrapping mul/add, a `>>32`
-// to uint32, `% skewedRange`, and `float64(r)*float64(r)/skewedScale` — all
-// defined identically in Go/Rust/C++.
+// genValueSkewed returns n unsorted values with density ∝ 1/√v (r*r/skewedScale
+// of an LCG residue), exercising the t-digest on a non-uniform population.
 func genValueSkewed(n int) []float64 {
 	out := make([]float64, n)
 	x := lcgSeed
@@ -115,10 +79,8 @@ func genValueSkewed(n int) []float64 {
 	return out
 }
 
-// genUniqueDistinct returns {1, 2, ..., n} — n distinct int64 values. Used by
-// the big-unique case (>65536 distinct forces the ChUnique thinning estimator,
-// exercising the approximate path) and, with repeats folded in by the caller,
-// the small exact case.
+// genUniqueDistinct returns {1, 2, ..., n}. Above 65536 distinct values
+// ChUnique switches to its approximate thinning estimator.
 func genUniqueDistinct(n int) []int64 {
 	out := make([]int64, n)
 	for i := 0; i < n; i++ {
@@ -127,21 +89,15 @@ func genUniqueDistinct(n int) []int64 {
 	return out
 }
 
-// withinAbsTol is the percentile tolerance band: an actual value is
-// accepted when |actual-truth| ≤ max(absFrac·|truth|, minAbs). absFrac is the
-// relative part (default 1%) and minAbs the absolute floor (default 1.0, so a
-// near-zero true quantile still has a usable band). The t-digest's quantile
-// error is bounded by ~1/compression in quantile space, well inside the 1% band
-// (see percentileTol).
+// withinAbsTol accepts |actual-truth| ≤ max(absFrac·|truth|, minAbs); the
+// absolute floor keeps a usable band for near-zero quantiles.
 func withinAbsTol(actual, truth, absFrac, minAbs float64) bool {
 	tol := math.Max(absFrac*math.Abs(truth), minAbs)
 	return math.Abs(actual-truth) <= tol
 }
 
-// withinRelTol is the unique ±relative band: accepted when
-// |actual-truth| ≤ rel·|truth|. Used for the big-unique approximate case at
-// rel=0.02 (±2%), which is ~4σ for the ChUnique thinning estimator at 100k
-// distinct (1σ≈0.45%). The exact small-unique case compares equality directly.
+// withinRelTol accepts |actual-truth| ≤ rel·|truth|. The big-unique case uses
+// rel=0.02, ~4σ for ChUnique at 100k distinct (1σ≈0.45%).
 func withinRelTol(actual, truth, rel float64) bool {
 	return math.Abs(actual-truth) <= rel*math.Abs(truth)
 }

@@ -1,25 +1,11 @@
-// Command e2e's differential conformance mode (--conformance): one network,
-// ClickHouse, ONE shared metadata, and TWO daemon stacks — agg/api/agent on
-// ClickHouse and agg/api/agent on duck-store — fed the IDENTICAL deterministic
-// stream by the harness itself (in-process statshouse-go clients), then one
-// semantic request set issued to BOTH apis with the decoded answers compared
-// under the frozen suite tolerances. ClickHouse is the reference: a duck answer
-// diverging beyond tolerance is a loud FAIL recorded with both raw responses,
-// so the mode runs in CI (`bash e2e/lima.sh --conformance`) and fails non-zero.
+// Command e2e's differential conformance mode (--conformance): a ClickHouse
+// stack and a duck stack over one shared metadata (so mappings are identical)
+// are fed the identical stream, and both apis' decoded answers are compared
+// with ClickHouse as the reference.
 //
-// Why in-process seeding: the go client stamps every packet with _h=<its own
-// hostname> (client_bucket.go fillTag). Seeding both agents from THIS process
-// makes the _h tag — and therefore every max_host string — literally identical
-// across the two backends, so host columns compare by exact value instead of by
-// luck of which container wrote. It also replays the go driver template's exact
-// seed/poll/settle/paced-write/Close sequence (drivers/go/main.go.tmpl), so the
-// data landing in both stores is what the frozen model already describes.
-//
-// Why one shared metadata: both aggregators auto-create the same names into one
-// metadata (deduped by name), metric/tag mappings are identical for both
-// stores, and both apis' journals converge on the same view — the conformance
-// question is purely "do the two STORES answer identically", which a second
-// metadata would only add noise to.
+// Seeding is in-process: the go client stamps packets with its own hostname
+// (_h), so one process feeding both agents makes max_host values identical
+// across backends. The sequence replays drivers/go/main.go.tmpl.
 package main
 
 import (
@@ -36,42 +22,30 @@ import (
 	statshouse "github.com/VKCOM/statshouse-go"
 )
 
-// conformanceClientTag isolates the conformance stream's metric names from the
-// per-client streams (stream.go generateStream folds it into the prefix), so a
-// leftover --keep stack's data can never blend into a conformance run.
+// conformanceClientTag keeps conformance metric names apart from the
+// per-client streams'.
 const conformanceClientTag = "conf"
 
-// conformanceSeedLead is the seconds-before-Base timestamp of the cold-start
-// seeds, matching the go driver template's SeedTS (client.go) so auto-create
-// behavior is identical to the frozen client phase.
+// conformanceSeedLead is how many seconds before Base the cold-start seeds
+// land, matching the go driver template's SeedTS.
 const conformanceSeedLead = 60
 
-// conformanceTimeout bounds one request's differential poll: the reference must
-// be non-empty AND both decoded answers must agree. The historic conveyor lands
-// data in ClickHouse ~24s after the writes, so this is comfortably above the
-// frozen assertTimeout while staying small enough that a genuinely divergent
-// request fails fast.
+// conformanceTimeout bounds one request's poll for a non-empty reference and
+// agreement; data lands ~24s after the writes.
 const conformanceTimeout = 120 * time.Second
 
-// conformancePollInterval is the differential poll tick.
 const conformancePollInterval = 3 * time.Second
 
 // confDivergenceSamples is how many consecutive disagreeing polls (with a
-// non-empty reference) confirm a divergence. Agreement polling exists for data
-// still in flight; once both stores hold their data a disagreement is final,
-// so failing fast keeps a red run inside the overall --timeout instead of
-// burning conformanceTimeout per bad request (the first live run hit exactly
-// that: two real divergences × 120 s + cascading teardown refusals).
+// non-empty reference) confirm a divergence. Once the reference has data a
+// disagreement will not heal, so failing fast keeps a red run within --timeout.
 const confDivergenceSamples = 3
 
-// statshouseGoEmptyAddrErr is the message statshouse-go v0.5.17's idle
-// secondary TCP connection reports on Close for a single-address client (see
-// seedConformanceStream for the full story).
+// statshouseGoEmptyAddrErr is the spurious Close error of a single-address
+// statshouse-go v0.5.17 client (see seedConformanceStream).
 const statshouseGoEmptyAddrErr = "empty statshouse address"
 
-// Stack tags (daemonStackOpts.stackTag) so the two conformance stacks coexist
-// on one network with distinct container names, and their captured logs land in
-// distinct artifacts files (serviceLogName).
+// Stack tags (daemonStackOpts.stackTag) for the two conformance stacks.
 const (
 	confStackCH   = "ch"
 	confStackDuck = "duck"
@@ -89,9 +63,8 @@ const (
 	confTagValues                 // GET /api/metric-tag-values
 )
 
-// confRequest is one semantic request issued to BOTH apis verbatim (path+query;
-// only the authority differs). qw is the tolerance key (count/sum/…/p90/
-// unique/max_count_host), not necessarily a query param of every endpoint kind.
+// confRequest is one request issued verbatim to both apis. qw selects the
+// tolerance; it is not necessarily a query param.
 type confRequest struct {
 	kind  confKind
 	label string // human-readable, e.g. "series/c_tagged/count"
@@ -99,37 +72,14 @@ type confRequest struct {
 	path  string // URL path+query, identical for both backends
 }
 
-// buildConformanceRequests derives the full differential request set from one
-// generated stream:
-//
-//   - series per metric × funcsFor(kind) — the SAME param shape the frozen
-//     asserter uses (parity asserted in conformance_test.go), covering count,
-//     cardinality, sum/min/max/avg, p50/p90/p99 and unique;
-//   - series-exact companions (count, sum) for every value_p metric: exact
-//     columns over the same data as the banded percentiles, so a percentile
-//     divergence is diagnosable in-run as data-level vs estimator-level;
-//   - host-column variants: qw=count with mh=1 (max_hosts alongside counts) and
-//     qw=max_count_host (DigestMax+maxhost);
-//   - a month-LOD series (w=1M): the one step whose bucket timestamps depend
-//     on a named timezone, so the time axis itself is compared exactly;
-//   - table view: v_mix qw=sum and c_matrix qw=count n=10000 (below the API's
-//     maxTableRowsPage clamp, so both sides return every row);
-//   - point view: c_tagged count, vp_mix p90, u_exact unique over the last
-//     bucket;
-//   - one PromQL-shaped multi-metric regex query ({__name__=~"a|b",…}), the
-//     dialect the UI uses for multi-metric graphs;
-//   - tag-values: c_matrix tag 0 (6 distinct values incl. unicode) and u_exact
-//     tag 0.
-//
-// Metric lookup is by generator suffix (c_tagged, v_mix, …): suffixes are unique
-// within a stream, so this is stable regardless of the run-id prefix.
+// buildConformanceRequests derives the request set from one stream: series
+// per metric and function, plus host-column, month-LOD, table, point, PromQL
+// and tag-values shapes. Metrics are found by their unique generator suffix.
 func buildConformanceRequests(stream metricStream) []confRequest {
 	var reqs []confRequest
 	base := stream.Base
 
-	// Series per metric per query function, with param parity to the frozen
-	// asserter (metricQueryURL): the differential must query the same shape the
-	// model-verified suite queries.
+	// Same param shape as the model-verified asserter (metricQueryURL).
 	for _, m := range stream.Metrics {
 		for _, qf := range funcsFor(m.Kind) {
 			path := strings.TrimPrefix(metricQueryURL("", m.Name, m.QBKeys, qf.qw, base), "http://")
@@ -142,16 +92,9 @@ func buildConformanceRequests(stream metricStream) []confRequest {
 		}
 	}
 
-	// Exact-function companions for every value_p metric: count (number of
-	// values) and sum are EXACT columns over the same per-bucket data whose
-	// percentiles are only banded. When a percentile request diverges, these
-	// requests make the run itself diagnose the class: count/sum differing
-	// means the two stores ingested different values (data-path divergence —
-	// fix the write path); count/sum identical means same data folded
-	// differently (estimator divergence — fix the quantile folding). This is
-	// not hypothetical: the first live run diverged on exactly one vp_mix
-	// percentile bucket (run 20260815-152438), and without these companions
-	// the artifacts could not separate the two hypotheses.
+	// Exact count/sum companions for every value_p metric: when a percentile
+	// diverges, these tell different ingested data from different quantile
+	// folding.
 	for _, m := range stream.Metrics {
 		if m.Kind != kindValueP {
 			continue
@@ -191,12 +134,8 @@ func buildConformanceRequests(stream metricStream) []confRequest {
 		})
 	}
 
-	// Month-LOD series: the one step whose bucket timestamps depend on a named
-	// timezone (local calendar month boundaries), so the time axis itself —
-	// compared exactly by compareConfSeries — is part of the parity contract.
-	// A duck-side zone bug shifts every month bucket by the zone offset
-	// without touching any value, which is why the shape gets its own entry
-	// instead of riding on the 1s series above.
+	// Month-LOD series: the only step whose bucket timestamps depend on the
+	// timezone, so a zone bug shows up in the time axis alone.
 	if m, ok := confMetric(stream, "c_tagged"); ok {
 		reqs = append(reqs, confRequest{
 			kind:  confSeries,
@@ -244,12 +183,8 @@ func buildConformanceRequests(stream metricStream) []confRequest {
 	pointReq("vp_mix", "p90")
 	pointReq("u_exact", "unique")
 
-	// PromQL-shaped multi-metric regex (the UI's multi-metric dialect); series
-	// are labelled with "__name__" inside tags, which tagSignature keeps so the
-	// two metrics' series stay distinguishable. Label names must stay UNQUOTED:
-	// Prometheus accepts `"__name__"=~…` but statshouse's parser only allows
-	// bare identifiers in label matching (verified live — the quoted form is a
-	// 400 parse error).
+	// PromQL multi-metric regex, as the UI issues. Label names must stay
+	// unquoted: statshouse's parser rejects Prometheus's `"__name__"=~…` form.
 	if multi, ok := confMetric(stream, "c_multi"); ok {
 		if matrix, ok := confMetric(stream, "c_matrix"); ok {
 			promql := fmt.Sprintf(`{__name__=~"%s|%s",__what__="count",__by__="0"}`, multi.Name, matrix.Name)
@@ -295,10 +230,8 @@ func confMetric(stream metricStream, suffix string) (metricModel, bool) {
 	return metricModel{}, false
 }
 
-// confShortName strips the run-id/client prefix for readable labels. It cuts
-// at the conformance client tag so the full generator suffix survives
-// (…_conf_c_tagged -> c_tagged, …_conf_vp_mix -> vp_mix) — a plain last-
-// underscore split would collide v_mix and vp_mix on "mix".
+// confShortName strips the run-id/client prefix for labels, cutting at the
+// client tag so v_mix and vp_mix do not both become "mix".
 func confShortName(name string) string {
 	if i := strings.LastIndex(name, "_"+conformanceClientTag+"_"); i >= 0 {
 		return name[i+len(conformanceClientTag)+2:]
@@ -309,9 +242,8 @@ func confShortName(name string) string {
 	return name
 }
 
-// confQueryPath builds GET /api/query with the frozen asserter's param shape
-// (s/f/t/w=1s/ac=1) plus whatever set adds (qw/mh/…), and qb repeated per
-// group-by key. Parity with metricQueryURL is pinned by unit test.
+// confQueryPath builds GET /api/query with metricQueryURL's param shape plus
+// whatever set adds.
 func confQueryPath(name string, qb []string, base uint32, set func(q url.Values)) string {
 	return confRangePath(base, func(q url.Values) {
 		q.Set("s", name)
@@ -322,9 +254,8 @@ func confQueryPath(name string, qb []string, base uint32, set func(q url.Values)
 	})
 }
 
-// confRangePath applies set over the shared range params every /api/query-style
-// endpoint takes: f/t over the stream's buckets and w=1s (explicit 1-second
-// step so the 1s tier is used), plus ac=1 to defeat the ~1s query cache.
+// confRangePath builds /api/query over the stream's buckets at w=1s, with
+// ac=1 to bypass the query cache.
 func confRangePath(base uint32, set func(q url.Values)) string {
 	q := url.Values{}
 	q.Set("f", strconv.FormatUint(uint64(base), 10))
@@ -335,9 +266,7 @@ func confRangePath(base uint32, set func(q url.Values)) string {
 	return "/api/query?" + q.Encode()
 }
 
-// confTablePath builds GET /api/table (same range params; n caps rows; 0 lets
-// the API default apply). n=10000 for the matrix metric sits exactly at
-// maxTableRowsPage, the API's clamp.
+// confTablePath builds GET /api/table; n caps rows (0 keeps the API default).
 func confTablePath(name string, qb []string, base uint32, qw string, n int) string {
 	p := confQueryPath(name, qb, base, func(q url.Values) {
 		q.Set("qw", qw)
@@ -348,8 +277,7 @@ func confTablePath(name string, qb []string, base uint32, qw string, n int) stri
 	return strings.Replace(p, "/api/query", "/api/table", 1)
 }
 
-// confPointPath builds GET /api/point over exactly the LAST bucket of the
-// stream (f=t-1), so each point is one unambiguous bucket.
+// confPointPath builds GET /api/point over the stream's last bucket.
 func confPointPath(name string, qb []string, base uint32, set func(q url.Values)) string {
 	q := url.Values{}
 	q.Set("s", name)
@@ -366,11 +294,8 @@ func confPointPath(name string, qb []string, base uint32, set func(q url.Values)
 
 // --- decoders ----------------------------------------------------------
 
-// confSeriesResp decodes GET /api/query (and the PromQL form): the payload sits
-// under "data"; sampling factors must be 0 (no sampling was configured);
-// series_meta carries per-series tags and — when hosts were requested — the
-// max_hosts strings. A missing point unmarshals to 0.0 (JSON null), which is
-// valid to compare: every expected value is non-zero.
+// confSeriesResp decodes GET /api/query. A null point decodes to 0, which is
+// safe to compare since every expected value is non-zero.
 type confSeriesResp struct {
 	Data struct {
 		Series            confSeriesData `json:"series"`
@@ -390,9 +315,7 @@ type confSeriesMeta struct {
 	MaxHosts []string              `json:"max_hosts"`
 }
 
-// confTableResp decodes GET /api/table: one row per (bucket, tag-set), its Data
-// aligned with What; More marks truncation. Rows are compared order-
-// insensitively keyed by (time, tag signature).
+// confTableResp decodes GET /api/table.
 type confTableResp struct {
 	Data struct {
 		Rows []struct {
@@ -405,8 +328,7 @@ type confTableResp struct {
 	} `json:"data"`
 }
 
-// confPointResp decodes GET /api/point: point_meta[i] describes the point
-// (tags, max_host, from/to seconds) and point_data[i] is its value.
+// confPointResp decodes GET /api/point.
 type confPointResp struct {
 	Data struct {
 		PointMeta []struct {
@@ -419,8 +341,7 @@ type confPointResp struct {
 	} `json:"data"`
 }
 
-// confTagValuesResp decodes GET /api/metric-tag-values: the tag's distinct
-// values with their counts, and whether the list was truncated.
+// confTagValuesResp decodes GET /api/metric-tag-values.
 type confTagValuesResp struct {
 	Data struct {
 		TagValues []struct {
@@ -431,8 +352,7 @@ type confTagValuesResp struct {
 	} `json:"data"`
 }
 
-// confDecoded is a type-erased decoded response: exactly the field for the
-// request's kind is populated.
+// confDecoded holds a decoded response; only the request kind's field is set.
 type confDecoded struct {
 	series *confSeriesResp
 	table  *confTableResp
@@ -442,25 +362,15 @@ type confDecoded struct {
 
 // --- comparators --------------------------------------------------------
 
-// confSumOrderTol is the relative band for sum/avg in the CROSS-STORE
-// comparison only: both stores aggregate the identical value multiset, but
-// float64 addition is not associative, and ClickHouse's native sum and the
-// Go-side fold over delta+archive rows accumulate in different orders — the
-// answers legitimately differ in the last few ulps (observed live:
-// 644601.744 vs 644601.7439999995, ~1e-16). Any semantic divergence (dropped
-// or duplicated values, wrong factor) is orders of magnitude above 1e-9.
-// The frozen asserter's exact-sum check against the generated model is
-// unaffected — this is the differential comparator only.
+// confSumOrderTol is the relative sum/avg band for the cross-store
+// comparison: the two stores add the same floats in different orders and
+// differ in the last ulps, while real divergences are orders of magnitude
+// larger.
 const confSumOrderTol = 1e-9
 
-// confValueMatches applies the suite's frozen tolerance table to one decoded
-// value with CH as truth (ref): exact equality for count/counter-derivatives
-// (count, countraw, cardinality, min, max, max_count_host's value column —
-// and table/point values of those kinds), the float-ordering band for sum/avg
-// (confSumOrderTol), the percentile band max(1%·|ref|, 1.0) for p50/p90/p99,
-// and exact-below/±2%-above the uniquesHashMaxSize threshold for unique
-// (mirroring compareUnique's exact-vs-thinning split, derived from the
-// reference magnitude).
+// confValueMatches applies the suite's tolerances with ref (CH) as truth:
+// exact by default, confSumOrderTol for sum/avg, the percentile band, and the
+// approximate band for unique above uniquesHashMaxSize.
 func confValueMatches(qw string, ref, got float64) bool {
 	switch qw {
 	case "p50", "p90", "p99":
@@ -477,12 +387,9 @@ func confValueMatches(qw string, ref, got float64) bool {
 	}
 }
 
-// compareConfSeries compares two /api/query replies: sampling factors must be 0
-// in EACH response independently, time axes exactly equal, series sets exactly
-// equal (matched by tagSignature — which keeps "__name__" so multi-metric
-// series distinguish), per-bucket values under confValueMatches, and — when the
-// reference carries max_hosts — the host strings exactly equal (both backends
-// were seeded by THIS process, so the host identity is literally shared).
+// compareConfSeries compares two /api/query replies: zero sampling factors,
+// equal time axes and series sets (by tagSignature), values under
+// confValueMatches, and exactly equal max_hosts.
 func compareConfSeries(ref, got *confSeriesResp, qw string) []string {
 	var diffs []string
 	for _, r := range []struct {
@@ -523,7 +430,6 @@ func compareConfSeries(ref, got *confSeriesResp, qw string) []string {
 	return diffs
 }
 
-// confSeriesRow is one indexed series' comparable payload.
 type confSeriesRow struct {
 	data  []float64
 	hosts []string
@@ -542,11 +448,8 @@ func indexConfSeries(r *confSeriesResp) map[string]confSeriesRow {
 	return out
 }
 
-// compareConfTable compares two /api/table replies order-insensitively: rows
-// keyed by (bucket, tagSignature), What columns and the truncation flag equal,
-// per-cell values under confValueMatches — the same tolerance table the
-// series comparator applies, because a table cell of sum/avg aggregates the
-// same float multiset in different orders as a series bucket does.
+// compareConfTable compares two /api/table replies order-insensitively, rows
+// keyed by (bucket, tagSignature), cells under confValueMatches.
 func compareConfTable(ref, got *confTableResp, qw string) []string {
 	var diffs []string
 	if strings.Join(ref.Data.What, ",") != strings.Join(got.Data.What, ",") {
@@ -591,9 +494,8 @@ func compareConfTable(ref, got *confTableResp, qw string) []string {
 	return diffs
 }
 
-// compareConfPoint compares two /api/point replies: points keyed by
-// tagSignature, from/to seconds and max_host exactly equal, values under
-// confValueMatches.
+// compareConfPoint compares two /api/point replies keyed by tags, host and
+// range.
 func compareConfPoint(ref, got *confPointResp, qw string) []string {
 	var diffs []string
 	if len(ref.Data.PointMeta) != len(got.Data.PointMeta) {
@@ -633,9 +535,8 @@ func compareConfPoint(ref, got *confPointResp, qw string) []string {
 	return diffs
 }
 
-// compareConfTagValues compares two /api/metric-tag-values replies exactly:
-// the (value, count) lists (order-insensitive — counts are compared by value)
-// and the truncation flag.
+// compareConfTagValues compares two /api/metric-tag-values replies exactly,
+// order-insensitively.
 func compareConfTagValues(ref, got *confTagValuesResp) []string {
 	var diffs []string
 	if ref.Data.TagValuesMore != got.Data.TagValuesMore {
@@ -663,7 +564,6 @@ func compareConfTagValues(ref, got *confTagValuesResp) []string {
 	return diffs
 }
 
-// compareConfRequest dispatches on the request kind.
 func compareConfRequest(req confRequest, ref, got confDecoded) []string {
 	switch req.kind {
 	case confSeries:
@@ -678,8 +578,8 @@ func compareConfRequest(req confRequest, ref, got confDecoded) []string {
 	return []string{fmt.Sprintf("unknown request kind %d", req.kind)}
 }
 
-// confNonEmpty reports whether the REFERENCE answer carries data — the guard
-// against vacuous passes (both sides answering empty agree trivially).
+// confNonEmpty reports whether the reference carries data, guarding against
+// vacuous passes.
 func confNonEmpty(kind confKind, dec confDecoded) bool {
 	switch kind {
 	case confSeries:
@@ -695,8 +595,7 @@ func confNonEmpty(kind confKind, dec confDecoded) bool {
 	return false
 }
 
-// formatConfRef renders a reference value for a diff line, banding the
-// approximate kinds so the expectation reads like the suite's own FAIL lines.
+// formatConfRef renders a reference value for a diff line, with its band.
 func formatConfRef(qw string, ref float64) string {
 	switch qw {
 	case "p50", "p90", "p99":
@@ -739,7 +638,6 @@ func sortedKeys[V any](m map[string]V) []string {
 
 // --- live: fetch + differential driver ---------------------------------
 
-// fetchConf issues one request to one api and decodes the kind's shape.
 func fetchConf(ctx context.Context, apiAddr string, req confRequest) (dec confDecoded, body string, status int, err error) {
 	body, status, err = httpGet(ctx, "http://"+apiAddr+req.path)
 	if err != nil {
@@ -771,17 +669,10 @@ func fetchConf(ctx context.Context, apiAddr string, req confRequest) (dec confDe
 	return dec, body, status, err
 }
 
-// runConformanceDifferential drives the whole request set against both apis.
-// Per request: poll until the CH reference is non-empty (the historic conveyor
-// lands data ~24s after the writes; bounded by conformanceTimeout) and both
-// decoded answers agree under the tolerances. Agreement passes immediately. A
-// divergence does NOT wait out the full timeout — both stores already hold
-// their data, so a disagreement will not self-heal; it is confirmed after
-// confDivergenceSamples consecutive polls (absorbs transient per-api cache
-// staleness) and then FAILs loudly with both raw responses recorded to the
-// artifacts (failed-queries.json). Returns pass/fail counts and whether the
-// context died mid-run, leaving requests unexecuted — a cancelled run must
-// not be reported as a pass.
+// runConformanceDifferential polls each request until the reference is
+// non-empty and both answers agree, or confDivergenceSamples consecutive
+// disagreements confirm a divergence (recorded with both raw responses).
+// cancelled reports that requests were left unexecuted.
 func runConformanceDifferential(ctx context.Context, rec *recorder, chAPI, duckAPI string, reqs []confRequest) (passed, failed int, cancelled bool) {
 	for _, req := range reqs {
 		var (
@@ -789,14 +680,14 @@ func runConformanceDifferential(ctx context.Context, rec *recorder, chAPI, duckA
 			refBody     string
 			gotBody     string
 			lastStatus  int
-			refSeen     bool // the reference carried data at least once
-			stableDiffs int  // consecutive polls with non-empty reference AND disagreement
+			refSeen     bool
+			stableDiffs int
 		)
 		deadline := time.Now().Add(conformanceTimeout)
 		done := false
 		for !done {
 			if cerr := ctx.Err(); cerr != nil {
-				// The run is tearing down (deadline/signal) — not a divergence.
+				// The run is tearing down; not a divergence.
 				return passed, failed, true
 			}
 			ref, rb, _, rerr := fetchConf(ctx, chAPI, req)
@@ -812,12 +703,12 @@ func runConformanceDifferential(ctx context.Context, rec *recorder, chAPI, duckA
 				default:
 					diffs = compareConfRequest(req, ref, got)
 					if len(diffs) == 0 {
-						done = true // agreement
+						done = true
 						break
 					}
 					stableDiffs++
 					if stableDiffs >= confDivergenceSamples {
-						done = true // confirmed divergence
+						done = true
 					}
 				}
 			} else if rerr != nil {
@@ -829,7 +720,7 @@ func runConformanceDifferential(ctx context.Context, rec *recorder, chAPI, duckA
 			}
 			if !done {
 				if !time.Now().Add(conformancePollInterval).Before(deadline) {
-					done = true // landing window exhausted
+					done = true
 				} else {
 					select {
 					case <-ctx.Done():
@@ -866,9 +757,8 @@ func runConformanceDifferential(ctx context.Context, rec *recorder, chAPI, duckA
 
 // --- live: in-process seeding -------------------------------------------
 
-// newConformanceClient builds the in-process statshouse-go client pointed at
-// one agent. MaxBucketSize 1<<18 mirrors the go driver template: the default
-// 1024 reservoir would silently sample the big-unique bucket client-side.
+// newConformanceClient builds a client for one agent. MaxBucketSize: the
+// default 1024 reservoir would sample the big-unique bucket client-side.
 func newConformanceClient(agentAddr string) *statshouse.Client {
 	return statshouse.NewClientEx(statshouse.ConfigureArgs{
 		StatsHouseAddr: agentAddr,
@@ -877,9 +767,8 @@ func newConformanceClient(agentAddr string) *statshouse.Client {
 	})
 }
 
-// confNamedTags renders generated tags as the client's NamedTags, empty values
-// verbatim (exercising the client's own empty-drop on the wire, as the driver
-// template does).
+// confNamedTags keeps empty values, leaving the drop to the client as the
+// driver template does.
 func confNamedTags(tags []tag) statshouse.NamedTags {
 	out := make(statshouse.NamedTags, 0, len(tags))
 	for _, t := range tags {
@@ -888,9 +777,8 @@ func confNamedTags(tags []tag) statshouse.NamedTags {
 	return out
 }
 
-// confSeedMetric sends one metric's cold-start seed with the kind-matching
-// write (so auto-create derives the right kind), exactly as the driver
-// template dispatches streamSeeds.
+// confSeedMetric sends a cold-start seed with the kind-matching write so
+// auto-create derives the right kind.
 func confSeedMetric(cl *statshouse.Client, s seedDef, ts uint32) {
 	switch s.Kind {
 	case kindValue:
@@ -902,10 +790,8 @@ func confSeedMetric(cl *statshouse.Client, s seedDef, ts uint32) {
 	}
 }
 
-// confWrite replays ONE generated write onto one client with the driver
-// template's exact dispatch (including the 2ms/50ms burst pacing between
-// large-payload writes). Values for value_p/unique are regenerated from the
-// deterministic genSpec, so both clients see byte-identical payloads.
+// confWrite replays one write with the driver template's dispatch and burst
+// pacing; value_p/unique payloads are regenerated deterministically.
 func confWrite(cl *statshouse.Client, w metricWrite) error {
 	tags := confNamedTags(w.Tags)
 	switch w.Kind {
@@ -952,8 +838,6 @@ func confWrite(cl *statshouse.Client, w metricWrite) error {
 	return nil
 }
 
-// metricsListNames is the minimal /api/metrics-list reply shape the pre-warm
-// poll needs (same slice as the driver template's metricsListReply).
 type metricsListNames struct {
 	Data struct {
 		Metrics []struct {
@@ -962,9 +846,8 @@ type metricsListNames struct {
 	} `json:"data"`
 }
 
-// waitConformanceMetrics blocks until /api/metrics-list (full=1) reports every
-// name — the driver template's pre-warm poll — so the agent's mapping cache is
-// subscribed before the real (counted) writes begin.
+// waitConformanceMetrics blocks until /api/metrics-list reports every name,
+// so mappings exist before the counted writes.
 func waitConformanceMetrics(ctx context.Context, apiAddr string, names []string) error {
 	return poll(ctx, 60*time.Second, 500*time.Millisecond, func() (bool, error) {
 		body, status, err := httpGet(ctx, "http://"+apiAddr+"/api/metrics-list?full=1")
@@ -988,12 +871,8 @@ func waitConformanceMetrics(ctx context.Context, apiAddr string, names []string)
 	})
 }
 
-// seedConformanceStream feeds the identical stream to both agents in-process:
-// cold-start seeds → metrics-list poll on BOTH apis → 2s mapping settle → the
-// paced writes (each write to both clients, deterministic generators shared) →
-// Close flush on both → 1s settle. The sequence mirrors drivers/go/main.go.tmpl
-// step for step; the only difference is that one process holds both clients,
-// which is what makes _h (and thus max_host) identical across backends.
+// seedConformanceStream feeds the identical stream to both agents, mirroring
+// drivers/go/main.go.tmpl: seeds, metrics-list poll, settle, writes, Close.
 func seedConformanceStream(ctx context.Context, rec *recorder, stream metricStream, apiAddrs, agentAddrs [2]string) error {
 	if len(agentAddrs) != 2 || len(apiAddrs) != 2 {
 		return fmt.Errorf("conformance seeding needs exactly 2 agents and 2 apis")
@@ -1032,17 +911,9 @@ func seedConformanceStream(ctx context.Context, rec *recorder, stream metricStre
 
 	for name, cl := range map[string]*statshouse.Client{"ch": ch, "duck": dk} {
 		if err := cl.Close(); err != nil {
-			// statshouse-go v0.5.17's TCP transport splits the (single-element)
-			// address list into a primary and a secondary connection, leaving the
-			// secondary's pool empty; its idle send loop then exits Close with
-			// errEmptyAddr even though the connected primary flushed cleanly —
-			// every healthy single-address client reproduces this (pinned by
-			// TestStatshouseGoSingleAddrCloseQuirk). tcpPoolConn.Close returns
-			// the PRIMARY's error first when it is non-nil, so a genuinely failed
-			// flush still surfaces here; only the structural secondary noise is
-			// skipped. (The go driver template is unaffected: it builds against
-			// the pinned fork in e2e/clients.txt, whose single-connection Close
-			// reports only real errors.)
+			// statshouse-go v0.5.17 gives a single-address client an empty
+			// secondary connection whose Close reports errEmptyAddr after a clean
+			// flush. A primary failure is returned first, so it still surfaces.
 			if err.Error() != statshouseGoEmptyAddrErr {
 				return fmt.Errorf("%s client close: %w", name, err)
 			}
@@ -1055,22 +926,17 @@ func seedConformanceStream(ctx context.Context, rec *recorder, stream metricStre
 
 // --- live: phase driver --------------------------------------------------
 
-// conformancePhaseOpts wires runConformancePhase from realMain.
 type conformancePhaseOpts struct {
 	runID     string
-	chAPI     string // published/host-reachable CH-stack api
-	duckAPI   string // duck-stack api container <ip>:port
-	chAgent   string // CH-stack agent <ip>:13337
+	chAPI     string
+	duckAPI   string
+	chAgent   string
 	duckAgent string
 }
 
-// runConformancePhase is the --conformance replacement for the client phase:
-// generate the stream, pre-create the value_p metrics via the CH api (one
-// shared metadata serves both stacks), seed both agents in-process, verify the
-// CH reference still matches the frozen model (a broken reference must abort
-// the differential rather than bless a coincidence), then run the differential
-// request set. Returns pass/fail counts and whether the run was cancelled
-// mid-differential (deadline or signal), leaving requests unexecuted.
+// runConformancePhase replaces the client phase under --conformance: seed
+// both stacks, check the CH reference against the model (a broken reference
+// aborts rather than blessing a coincidence), then run the differential.
 func runConformancePhase(ctx context.Context, rec *recorder, o conformancePhaseOpts) (passed, failed int, cancelled bool) {
 	stream := generateStream(o.runID, conformanceClientTag, time.Now())
 
@@ -1086,8 +952,7 @@ func runConformancePhase(ctx context.Context, rec *recorder, o conformancePhaseO
 		return 0, 1, false
 	}
 
-	// Reference gate: ClickHouse must match the frozen model before its answers
-	// are trusted as the reference.
+	// ClickHouse must match the model before it is trusted as the reference.
 	refPass, refFail := assertStream(ctx, rec, o.chAPI, conformanceClientTag, stream)
 	if refFail > 0 {
 		rec.logf("FAIL conformance: the ClickHouse reference does not match the expected model (%d assertion(s) failed) — aborting the differential; the reference itself is broken", refFail)

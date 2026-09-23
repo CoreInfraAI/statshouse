@@ -29,11 +29,8 @@ func TestRunIDRe(t *testing.T) {
 	}
 }
 
-// TestSelectDrivers covers the --client resolution: empty = all (default order),
-// a tag selects one, the full "statshouse-<tag>" form is accepted, repeats
-// dedupe, and an unknown selector is a hard error. Comparison is by tag/name only
-// because clientDriver carries a function field, and reflect.DeepEqual defines
-// non-nil funcs as never equal.
+// TestSelectDrivers compares by tag because clientDriver has a func field, which
+// reflect.DeepEqual never treats as equal.
 func TestSelectDrivers(t *testing.T) {
 	tags := func(ds []clientDriver) []string {
 		out := make([]string, len(ds))
@@ -103,8 +100,6 @@ func TestSelectDrivers(t *testing.T) {
 	})
 }
 
-// TestClientFlag covers the repeatable --client flag.Var: Set appends and String
-// joins, mirroring flag's contract for repeated values.
 func TestClientFlag(t *testing.T) {
 	var c clientFlag
 	if c.String() != "" {

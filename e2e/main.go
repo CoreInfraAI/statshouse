@@ -1,13 +1,10 @@
-// Command e2e drives the StatsHouse end-to-end test harness.
-//
-// The first phase brought up a single-node ClickHouse with the committed schema and
-// proved the harness skeleton (runtime abstraction, preflight, readiness probes,
-// teardown, artifacts).
-//
-// This builds on that: it cross-compiles the four daemons (metadata, agg,
-// api, agent), bind-mounts each into a minimal alpine image, and brings up the
-// full five-service stack — clickhouse, metadata, agg, api, agent — wired by
-// inspected IP, then proves /api/query answers on the published port.
+// Command e2e is the StatsHouse end-to-end harness. It cross-compiles the
+// daemons, brings up metadata, agg, api and agent in containers over either
+// storage backend (ClickHouse, or duck with no ClickHouse container), drives
+// the real clients against the agent and asserts the api's answers.
+// --conformance instead boots both backends over one shared metadata, seeds
+// the same stream to both and compares their decoded answers (CH is the
+// reference).
 //
 //	go run ./e2e
 package main
@@ -32,14 +29,12 @@ import (
 )
 
 // e2ePrefix namespaces every resource the harness creates so it can prune its
-// own leftovers without touching unrelated containers/networks (e.g. a parallel
-// project's stack on the same machine).
+// own leftovers without touching unrelated containers/networks.
 const e2ePrefix = "e2e-"
 
-// runIDRe constrains --run-id: the value flows into resource names (apple/container
-// requires lowercase network names) and the artifacts path, so it must not contain
-// path separators, dots, or uppercase. The leading char is alphanumeric to avoid a
-// leading dash (which CLIs can reject as a flag-like value).
+// runIDRe constrains --run-id: it becomes resource names (apple/container
+// requires lowercase network names) and an artifacts path; a leading dash would
+// read as a CLI flag.
 var runIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 
 func main() {
@@ -62,9 +57,6 @@ func main() {
 	flag.Var(&backend, "storage-backend", "storage backend the daemons run: \"clickhouse\" (default; the usual stack) or \"duck\" (DuckDB embedded in the aggregator; no ClickHouse container, the api reads through the aggregator's RPC)")
 	flag.Parse()
 	if *conformance {
-		// Conformance compares the ch and duck backends side by side, so its
-		// CH stack must run on ClickHouse (the duck stack is started
-		// internally), and it seeds its own stream — no client drivers.
 		if backend != backendClickHouse {
 			fmt.Fprintf(os.Stderr, "FAIL: --conformance compares clickhouse vs duck and boots its own ClickHouse stack; do not pass --storage-backend (leave it at the default)\n")
 			os.Exit(2)
@@ -77,9 +69,7 @@ func main() {
 	os.Exit(realMain(*runtimeFlag, *runIDFlag, *archFlag, backend, *keep, *verbose, *timeout, clientSel, *skipClientBuild, *withUI, *apiPortFlag, *prewarmRetries, *conformance))
 }
 
-// clientFlag is a repeatable --client selector (flag.Var). Each Set appends, so
-// `--client=go --client=rust` selects both; absent → empty → selectDrivers picks
-// all clients.
+// clientFlag is a repeatable --client selector; empty selects all clients.
 type clientFlag []string
 
 func (c *clientFlag) String() string {
@@ -94,13 +84,10 @@ func (c *clientFlag) Set(v string) error {
 	return nil
 }
 
-// clientDriver is one client the harness can build+run+assert. name matches the
-// active entry in e2e/clients.txt; tag is the short --client selector AND the
-// per-client metric-name prefix that isolates one client's writes from another's
-// (stream.go); buildRun is the language-specific clone→render→build→run.
-// baseImage is the pinned toolchain tag the driver builds+runs in (used by the
-// --skip-client-build cache guard). renderSource renders the stream to driver
-// source TEXT (pure, host-side) so the cache guard can hash it without a build.
+// clientDriver is one client the harness can build, run and assert. tag is both
+// the --client selector and the metric-name prefix isolating this client's
+// writes. renderSource is pure so the --skip-client-build guard can hash the
+// driver source without building.
 type clientDriver struct {
 	name         string // e.g. "statshouse-go"
 	tag          string // e.g. "go"
@@ -109,9 +96,7 @@ type clientDriver struct {
 	renderSource func(repoRoot string, stream metricStream) (string, error)
 }
 
-// clientDrivers is the registry of every client the harness can drive, in the
-// order a default (no --client) run executes them. Adding a client here (and to
-// e2e/clients.txt) is all the wiring the main loop needs.
+// clientDrivers lists every client, in default run order.
 var clientDrivers = []clientDriver{
 	{
 		name: goClientName, tag: goClientTag, baseImage: goBaseImage, buildRun: buildAndRunGoClient,
@@ -133,10 +118,8 @@ var clientDrivers = []clientDriver{
 	},
 }
 
-// selectDrivers resolves the repeatable --client selectors to the drivers to
-// run. An empty selection means all of them (the default). Each selector may be
-// a tag ("go"/"rust"/"cpp") or the full client name ("statshouse-go"); an
-// unknown selector is a hard error. Duplicates collapse to the first occurrence.
+// selectDrivers resolves --client selectors (tag or full client name) to
+// drivers; empty means all, duplicates collapse.
 func selectDrivers(sels []string) ([]clientDriver, error) {
 	if len(sels) == 0 {
 		return clientDrivers, nil
@@ -161,15 +144,9 @@ func selectDrivers(sels []string) ([]clientDriver, error) {
 	return out, nil
 }
 
-// validateSkipClientBuild runs the PURE host-side --skip-client-build validation
-// for every selected driver: each one's cached build must be present, match the
-// client+arch, carry a driver binary, and (for new descriptors) match the current
-// base image + rendered-source hash. It is called eagerly — right after driver
-// selection, BEFORE the ~1min ClickHouse/daemon stack bring-up — so a bad skip-run
-// (no cache, stale cache, template/toolchain drift) fails in <1s instead of after
-// the full stack is up (F6). repoRoot/cache mirror the per-client build-cache
-// resolution runClientPhase does, so the early check sees exactly what the phase
-// will see.
+// validateSkipClientBuild checks every selected driver's cached build on the
+// host before the ~1min stack bring-up, so a missing or stale cache fails in
+// under a second.
 func validateSkipClientBuild(drivers []clientDriver, repoRoot, cache, arch string) error {
 	for _, d := range drivers {
 		_, buildCache, err := clientBuildCacheFor(repoRoot, cache, d.name, d.tag, arch)
@@ -183,8 +160,7 @@ func validateSkipClientBuild(drivers []clientDriver, repoRoot, cache, arch strin
 	return nil
 }
 
-// driverTags returns the comma-joined tags of the selected drivers (e.g. "go,
-// rust, cpp") for the progress log.
+// driverTags returns the comma-joined driver tags for the progress log.
 func driverTags(drivers []clientDriver) string {
 	tags := make([]string, 0, len(drivers))
 	for _, d := range drivers {
@@ -215,20 +191,14 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 		return 2
 	}
 
-	// --with-ui is handled early: the npm UI is built in a pinned node
-	// container (offline against a host-populated cache on apple/container; online
-	// via NAT egress on docker) and its output is mounted into the api as
-	// --static-dir=/ui. Off by default — no node, no UI build.
-
 	rec := &recorder{verbose: verbose, artifactsDir: artifactsDir, runID: runID}
 	rec.logf("runid=%s artifacts=%s", runID, artifactsDir)
 
 	network := e2ePrefix + runID
 	chContainer := e2ePrefix + runID + "-clickhouse"
 
-	// The run context is cancelled by --timeout OR an incoming SIGINT/SIGTERM.
-	// Deferred calls (teardown) still run on signal-driven cancel because
-	// NotifyContext cancels the context rather than killing the process.
+	// NotifyContext cancels rather than kills, so deferred teardown still runs
+	// on SIGINT/SIGTERM.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -249,12 +219,8 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 	}
 	rec.logf("preflight ok (%s)", rt.Name())
 
-	// --with-ui on a runtime WITHOUT in-container network (apple/container) needs host
-	// npm: the offline container build consumes a host-populated cache, and populating
-	// it passes npm --os/--cpu/--libc (npm >= npmMinMajor). Checked at preflight so a
-	// missing/old npm fails before any container or network is created. The docker
-	// runtime installs online in the node container (NAT egress), so host npm is not
-	// required there. Strictly opt-in: default runs do none of this.
+	// Without in-container network (apple/container) the UI build is offline
+	// against a cache warmed by host npm, which needs --os/--cpu/--libc.
 	if withUI && !rt.HasNetworkEgress() {
 		if !lookPath("npm") {
 			return fail(rec, artifactsDir, rt, nil, fmt.Errorf("--with-ui needs npm on the host to warm the build cache (apple/container has no in-container network); install Node/npm or use the docker runtime"))
@@ -264,10 +230,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 		}
 	}
 
-	// --- resolve selected drivers + e2e cache + arch early ---
-	// All three are pure host-side resolutions; doing them here (before any container
-	// is created) lets --skip-client-build fail FAST on a missing/stale/drifted cache
-	// instead of after the ~1min stack bring-up (F6).
+	// Resolved before any container exists so --skip-client-build fails fast.
 	arch := resolveArch(archFlag)
 	drivers, err := selectDrivers(clientSel)
 	if err != nil {
@@ -284,7 +247,6 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 		rec.logf("--skip-client-build: cached build validated for client(s) %s", driverTags(drivers))
 	}
 
-	// --- prune leftovers from prior runs (before creating this run's resources) ---
 	prunedC, prunedN := pruneStale(ctx, rt)
 	if prunedC+prunedN > 0 {
 		rec.logf("pruned %d stale container(s), %d stale network(s)", prunedC, prunedN)
@@ -292,29 +254,19 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 		rec.logf("no stale e2e-* resources to prune")
 	}
 
-	// Every container created during the run, appended as it starts, so teardown
-	// and fail() can clean/capture them uniformly (even on partial starts).
+	// Every container created during the run, appended as it starts (even on
+	// partial starts), for teardown and fail().
 	var containers []string
 
-	// Pre-declared so the --keep branch of the teardown closure (below) can read
-	// them: both are assigned further down (after loadConfig / startDaemonStack)
-	// and stay nil/empty on an early abort, which is exactly the case where the
-	// closure must NOT try to print a reachable api address.
+	// Pre-declared for the --keep teardown; empty/nil on an early abort.
 	var (
-		apiAddr string       // the api's published host address, resolved before the published-port preflight
-		ds      *daemonStack // started after the daemons build
+		apiAddr string
+		ds      *daemonStack
 	)
 
-	// --- teardown unless --keep ---
-	// Uses a fresh context (not the run ctx, which the --timeout deadline or a
-	// signal may have cancelled) so cleanup still runs after the run deadline fires.
+	// Teardown uses a fresh context: the run ctx may already be cancelled.
 	teardown := func() {
 		if keep {
-			// Print how to reach the kept stack so a human can poke it without
-			// re-deriving addresses (--keep leaves the stack running and
-			// the harness prints how to reach it). The api is the only published
-			// port by default; when it is not published the container IP is reachable
-			// only from inside the run network. cfg/ds are nil on an early abort.
 			rec.logf("keeping resources (--keep): %d container(s) %v on network %s", len(containers), containers, network)
 			addr := apiAddr
 			if addr == "" && ds != nil && ds.api != nil {
@@ -325,9 +277,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 				rec.logf("  reach the api:  curl 'http://%s/api/query?s=__agg_bucket_receive_delay_sec&f=%d&t=%d&w=1s&qw=count&ac=1'",
 					addr, now.Add(-5*time.Minute).Unix(), now.Unix())
 				if withUI {
-					// The built UI is served by the api from its --static-dir at /.
-					// Strip the "(container IP — …)" annotation off addr so this is a
-					// real http://host:port/ a browser can open.
+					// Strip the "(container IP — …)" annotation off addr.
 					uiAddr := addr
 					if i := strings.Index(uiAddr, "  "); i >= 0 {
 						uiAddr = uiAddr[:i]
@@ -339,9 +289,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 			rec.logf("  tear it down:   %s rm -f %s   &&   %s network rm %s",
 				rt.Name(), strings.Join(containers, " "), rt.Name(), network)
 			rec.logf("  note: the next `go run ./e2e` prunes this stack.")
-			// These keep lines are logged in the DEFERRED teardown, which runs AFTER
-			// writeRunArtifacts already wrote summary.txt — re-write the summary so the
-			// --keep reachability/note lines are captured in the artifact too (F5).
+			// summary.txt was already written; rewrite it to include these lines.
 			writeSummary(artifactsDir, rec.lines)
 			return
 		}
@@ -370,12 +318,6 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 	}
 	rec.logf("created network %s", network)
 
-	// --- preflight published-port check + load publish config ---
-	// Every published host port must be FREE before any container binds one.
-	// Two concurrent harness runs collide hard — prune wars plus the fixed api
-	// publish port mean one run's assertions silently query the other's api.
-	// Bail before the expensive ClickHouse/daemon setup if a configured host
-	// port already answers.
 	apiAddr, err = resolveAPIAddr(apiPortFlag)
 	if err != nil {
 		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("--api-port: %w", err))
@@ -385,22 +327,13 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 		return fail(rec, artifactsDir, rt, containers, err)
 	}
 
-	// --- build the npm UI when --with-ui is set ---
-	// Done EARLY — right after the published-port preflight, before ClickHouse and
-	// the daemon build — so a UI failure fails fast instead of after the ~1min stack
-	// bring-up. Defaults: the placeholder page (e2e/api-static/index.html) mounted at
-	// /static. With the flag, the built UI (statshouse-ui/build, index.html at its
-	// root) is mounted at /ui instead. The api is built WITHOUT the embed tag, so it
-	// always loads index.html from --static-dir — never an embed-tag api build.
+	// The UI is built before ClickHouse so a UI failure fails fast. The api is
+	// built without the embed tag, so it always serves --static-dir: the
+	// placeholder page by default, the built UI under --with-ui.
 	apiStaticDir := filepath.Join(root, "e2e", "api-static")
 	apiMountTarget := apiStaticMount
 	if withUI {
-		// Track the one-shot build container BEFORE launching it: a context-cancelled
-		// build SIGKILLs the local CLI and may orphan the container, and this run's
-		// teardown (not just the next run's pruneStale) should reap it. Rm is idempotent
-		// (resourceInList no-op), so a normally-AutoRm'd container is a harmless no-op
-		// here, and dumpServiceLogs filters by presence. Host-npm prerequisites were
-		// already checked at preflight (above); no duplicate check here.
+		// Tracked before launch: a cancelled build can orphan the container.
 		uiBuildC := e2ePrefix + runID + "-uibuild"
 		containers = append(containers, uiBuildC)
 		uiBuildDir, err := buildUI(ctx, rt, root, cache, uiBuildC, rec.logf)
@@ -411,12 +344,8 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 		apiMountTarget = apiUIMount
 	}
 
-	// --- ClickHouse (clickhouse backend only) ---
-	// Under duck no ClickHouse container starts and nothing replaces it: the
-	// aggregator IS the storage (DuckDB embedded in the duckdb-tagged build),
-	// so the stack is one container shorter and the agg's own store-query RPC
-	// (probed in startDaemonStack) replaces the ClickHouse schema probe as the
-	// storage-readiness gate.
+	// Under duck the aggregator is the storage; its store-query RPC probe (in
+	// startDaemonStack) replaces the ClickHouse schema probe.
 	var chIP string
 	if backend == backendDuck {
 		rec.logf("storage backend=duck: no ClickHouse container (DuckDB embedded in the aggregator)")
@@ -433,8 +362,6 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 			return fail(rec, artifactsDir, rt, containers, fmt.Errorf("clickhouse: %w", err))
 		}
 		if ch.ip == "" {
-			// An earlier phase treated a missing IP as non-fatal (it probed CH via Exec). The
-			// daemon stack wires to CH by IP, so here it is fatal.
 			return fail(rec, artifactsDir, rt, containers, fmt.Errorf("clickhouse has no inspected IP on %s; daemons wire to it by IP", network))
 		}
 		chIP = ch.ip
@@ -456,16 +383,13 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 		}
 	}
 
-	// --- build the four daemons (cached across runs) ---
 	binDir, err := buildDaemons(ctx, root, arch, backend, rec.logf)
 	if err != nil {
 		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("build daemons: %w", err))
 	}
 
-	// Shared RPC crypto key: mounted into all four daemons so their cross-
-	// container RPC (metadata↔agg, metadata↔api, agg↔agent) passes the nonce
-	// exchange, which requires encryption whenever the peers are not on the same
-	// machine (always true here). Removed after the run.
+	// Shared RPC crypto key: the nonce exchange requires encryption between
+	// peers on different machines, which every container pair is.
 	rpcKeyPath, err := writeRPCKey()
 	if err != nil {
 		return fail(rec, artifactsDir, rt, containers, err)
@@ -475,8 +399,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 	start := time.Now()
 	chStackTag := ""
 	if conformance {
-		// Tag the stacks so the ch and duck daemon sets coexist on one network
-		// with distinct container names (e2e-<runid>-ch-agg / -duck-agg).
+		// Distinct container names for the two stacks on one network.
 		chStackTag = confStackCH
 	}
 	ds, err = startDaemonStack(ctx, rt, rec, daemonStackOpts{
@@ -497,7 +420,6 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 	}
 	rec.logf("daemon stack ready (metadata+agg+api+agent green in %.1fs)", time.Since(start).Seconds())
 
-	// --- /api/query answers on the published port ---
 	queryAddr := apiAddr
 	body, err := queryAPI(ctx, queryAddr)
 	if err != nil {
@@ -505,11 +427,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 	}
 	rec.logf("/api/query answered 200 on %s (%d bytes)", queryAddr, len(body))
 
-	// --- with-ui: prove the api serves the BUILT UI at /, not the placeholder ---
-	// The api serves the static dir's index.html on the same HTTP port as /api/query,
-	// so once /api/query answers the UI is reachable too. A positive GET of the root
-	// (200 + the built app's React mount) fails the run loudly if --with-ui did not
-	// actually wire build/ into --static-dir.
+	// Prove the api serves the built UI at /, not the placeholder.
 	if withUI {
 		uiBody, err := assertUIServed(ctx, queryAddr)
 		if err != nil {
@@ -518,20 +436,15 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 		rec.logf("UI served on %s (GET / -> 200, built index.html %d bytes)", queryAddr, len(uiBody))
 	}
 
-	// --- gate "stack ready" on a REAL agent→agg→api round-trip, not just TCP
-	// dials: the agent↔agg channel can be dead while every TCP probe
-	// is green, and every client write then silently times out. A recent point on
-	// the agg's receive-delay builtin proves the conveyor is live before clients
-	// start. ---
+	// Gate on a real agent→agg→api round-trip: the agent↔agg channel can be
+	// dead while every TCP probe is green.
 	if err := waitAggConveyor(ctx, queryAddr); err != nil {
 		return fail(rec, artifactsDir, rt, containers, err)
 	}
 	rec.logf("agent↔agg conveyor live (recent %s point)", queryMetric)
 
-	// --- conformance: boot the SECOND (duck) stack over the SHARED metadata ---
-	// buildDaemons is idempotent across backends (one shared bin dir + mtime
-	// cache; only statshouse-agg differs, cached separately as the duckdb-tagged
-	// build), so this second call only cross-compiles the duck aggregator.
+	// Conformance: boot the duck stack over the shared metadata. Only the
+	// aggregator differs, so this buildDaemons compiles just the duck agg.
 	var duckAPIAddr, duckAgentAddr string
 	if conformance {
 		duckBinDir, err := buildDaemons(ctx, root, arch, backendDuck, rec.logf)
@@ -551,11 +464,8 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 			stackTag:     confStackDuck,
 			sharedMeta:   ds.metadata,
 		})
-		// The duck stack reuses the shared metadata container (already tracked
-		// above), so only its own three services are appended — on a partial
-		// start too, exactly like the metadata stack's nil-safe failure path:
-		// the started containers must still be torn down, and dereferencing a
-		// half-built stack would crash the harness before it reports.
+		// Metadata is already tracked; append only the started duck services
+		// (nil-safe on a partial start).
 		for _, s := range []*service{dsDuck.agg, dsDuck.api, dsDuck.agent} {
 			if s != nil {
 				containers = append(containers, s.name)
@@ -577,11 +487,8 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 		rec.logf("duck stack ready: /api/query 200 + conveyor live on %s (agent %s)", duckAPIAddr, duckAgentAddr)
 	}
 
-	// Under -v, stream each daemon container's logs to stderr LIVE while the run
-	// proceeds (-v streams logs live). Stopped before teardown (the stop
-	// defer is registered after teardown's, so it runs first — LIFO) so the tail
-	// goroutine never races the container Rm. containers holds clickhouse + the four
-	// daemons by now; client containers run foreground (their stdout already streams).
+	// Under -v, stream daemon logs live. This defer runs before teardown's
+	// (LIFO), so the tail never races the container Rm.
 	var stopStreamer func()
 	if verbose {
 		stopStreamer = startLogStreamer(ctx, rt, containers, runID)
@@ -592,13 +499,6 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 		}
 	}()
 
-	// --- client phase: drive each selected client over TCP
-	// with explicit historic timestamps, wait for its clean exit, then assert
-	// per-kind per-bucket/per-series equality across the full metric matrix
-	// (counter/value/value_p/unique/stag). go came first; rust and cpp follow on
-	// the same path; a later phase extends the stream + the
-	// assertions to all metric kinds. The three are isolated by per-client metric
-	// prefixes so their values never collide on the shared stack. ---
 	phaseOpts := clientPhaseOpts{
 		network:          network,
 		agentIP:          ds.agent.ip,
@@ -615,10 +515,8 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 	var totalPass, totalFail int
 	cancelled := false
 	if conformance {
-		// The conformance phase replaces the client drivers: the harness itself
-		// seeds the identical stream to BOTH agents in-process (one hostname →
-		// identical _h/max_host across backends), gates on the CH reference
-		// matching the frozen model, then runs the differential request set.
+		// The harness seeds both agents itself (one hostname, so _h/max_host
+		// agree across backends) instead of running client drivers.
 		totalPass, totalFail, cancelled = runConformancePhase(ctx, rec, conformancePhaseOpts{
 			runID:     runID,
 			chAPI:     queryAddr,
@@ -633,16 +531,12 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 			totalFail += f
 		}
 	}
-	// The run is a failure if any client's assertions failed (non-zero exit) even
-	// though the stack came up. Service logs are dumped on failure for diagnosis.
 	if totalFail > 0 {
 		dumpServiceLogs(rec, rt, containers, artifactsDir)
 		writeRunArtifacts(artifactsDir, rec)
 		return 1
 	}
-	// A cancelled conformance run must not read as PASS: the differential was
-	// cut short (deadline or signal), so the unexecuted requests are neither
-	// passed nor failed — the run is reported as interrupted and fails.
+	// A cut-short differential must not read as PASS.
 	if cancelled {
 		dumpServiceLogs(rec, rt, containers, artifactsDir)
 		writeRunArtifacts(artifactsDir, rec)
@@ -653,10 +547,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 		return 1
 	}
 
-	// --- PASS summary ---
-	// On a successful run the service logs are only captured under -v (matching the
-	// failure path, which always dumps them); captured before the summary write so
-	// any dump progress lines land in summary.txt too.
+	// On success service logs are captured only under -v.
 	if verbose {
 		dumpServiceLogs(rec, rt, containers, artifactsDir)
 	}
@@ -679,40 +570,29 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 	return 0
 }
 
-// clientPhaseOpts configures runClientPhase. It is shared across clients; each
-// client folds its own tag into the generated stream's metric-name prefix.
+// clientPhaseOpts configures runClientPhase; shared across clients.
 type clientPhaseOpts struct {
 	network          string
-	agentIP          string // agent container IP on the run network
-	apiAddr          string // published api address (host:port) for assertions
-	apiContainerAddr string // api container <ip>:port on the run network (driver pre-warm polling)
+	agentIP          string
+	apiAddr          string // published api address for assertions
+	apiContainerAddr string // api <ip>:port on the run network (driver pre-warm polling)
 	runID            string
 	arch             string
 	repoRoot         string
 	artifactsDir     string
-	cache            string // e2e cache root (~/.cache/statshouse-e2e)
-	skipClientBuild  bool   // --skip-client-build: replay the cached driver binary + stream
-	prewarmRetries   int    // --prewarm-retries: extra attempts on a pre-warm timeout (driver exit 3)
+	cache            string
+	skipClientBuild  bool
+	prewarmRetries   int
 }
 
-// preWarmRetryBackoff is the wait between pre-warm retries in runClientPhase:
-// long enough for a transient journal-longpoll stall to clear, short enough that
-// the default 2 retries (3 attempts) stay well inside the overall run timeout.
+// preWarmRetryBackoff lets a transient journal-longpoll stall clear while the
+// default retries stay well inside the run timeout.
 const preWarmRetryBackoff = 20 * time.Second
 
-// runClientPhase drives one client: generate its per-client metric stream,
-// pre-create the value_p metrics (which never auto-create), build+run its driver
-// in the foreground, wait for the clean exit, then assert per-kind per-bucket/
-// per-series equality. Returns pass/fail counts for this client. A build/run
-// launch error or a non-zero driver exit is reported as a single FAIL line for
-// the client (all its metrics fail). The harness waits for the driver process to
+// runClientPhase drives one client: generate its stream, pre-create value_p
+// metrics, build and run its driver, then assert. It waits for the driver to
 // exit before asserting because rust/cpp flush only on destruction.
 func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriver, o clientPhaseOpts) (passed, failed int) {
-	// Resolve this client's pinned ref (e2e/clients.txt) → its per-(tag,ref,arch)
-	// build-cache dir. The dir is where a normal build writes the driver binary +
-	// stream descriptor, and where --skip-client-build later reads them back. spec
-	// is the resolved client handed to the build+run step so it need not re-parse
-	// clients.txt itself.
 	spec, buildCache, err := clientBuildCacheFor(o.repoRoot, o.cache, d.name, d.tag, o.arch)
 	if err != nil {
 		rec.logf("FAIL %s: resolve build cache: %v", d.name, err)
@@ -720,23 +600,14 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 		return 0, 1
 	}
 
-	// statusAnchor is the wall-clock unix time at client-phase start. The realtime
-	// builtins (__src_ingestion_status / __src_client_write_err / __agg_sampling_factor)
-	// are recorded by the agent at RECEIVE time (≈ now during the driver run), NOT at
-	// the events' historic ts. On a normal run base≈now−120 so the historic base
-	// "happens to" cover them, but a --skip-client-build REPLAY keeps the descriptor's
-	// OLD base while the agent records THIS run's events at replay-now — so the
-	// ledger/rejection/tripwire windows must anchor at statusAnchor, not stream.Base
-	// (the matrix alone keeps stream.Base; its historic ts are embedded in the binary).
+	// The realtime builtins (__src_ingestion_status, __src_client_write_err,
+	// __agg_sampling_factor) are recorded at receive time, not the events'
+	// historic ts; a --skip-client-build replay keeps an old stream.Base, so
+	// their windows anchor here instead.
 	statusAnchor := uint32(time.Now().Unix())
 
-	// Stream source. --skip-client-build replays the EXACT stream a cached driver
-	// binary was compiled from: the driver embeds the metric names + the historic
-	// base, so it only matches the stream it was built against. We cache a tiny
-	// descriptor (runID+base) and REGENERATE the deterministic stream from it
-	// (generateStream is a pure function of runID+base), so the cached binary and
-	// the expected model agree bit-for-bit. A normal run generates a fresh stream,
-	// renders+compiles the driver into buildCache, and writes the descriptor.
+	// A cached driver binary embeds its stream's names and base, so a replay
+	// regenerates the identical stream from the cached descriptor (runID+base).
 	stream, cached, err := streamForClientPhase(d, o, buildCache)
 	if err != nil {
 		rec.logf("FAIL %s: %v", d.name, err)
@@ -746,9 +617,7 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 	rec.logf("%s: stream %s: base=%d buckets=%d metrics=%d writes=%d",
 		d.name, streamSourceLabel(cached), stream.Base, numBuckets, len(stream.Metrics), len(stream.Writes))
 
-	// value_p never auto-creates from a wire payload (autocreate derives only
-	// counter/value/unique), so pre-create its mapping before the driver runs.
-	// Metric names embed the unique runID, so each POST creates a fresh metric.
+	// value_p never auto-creates (autocreate derives only counter/value/unique).
 	if err := createValuePMetrics(ctx, rec, o.apiAddr, stream); err != nil {
 		rec.logf("FAIL %s: pre-create value_p metrics: %v", d.name, err)
 		fmt.Printf("FAIL %s: pre-create value_p metrics: %v\n", d.tag, err)
@@ -758,20 +627,14 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 	agentAddr := net.JoinHostPort(o.agentIP, strconv.Itoa(agentPort))
 	clientContainer := e2ePrefix + o.runID + "-client-" + d.tag
 
-	// F7: write the stream descriptor at BUILD time (before the build runs) so a
-	// successful build pairs it with the binary EVEN IF the driver run later fails.
-	// The old code wrote it only after a clean exit, so a build-succeed/run-fail left
-	// a NEW binary paired with an OLD descriptor → the next --skip-client-build
-	// replayed a stale model and failed all-absent. A failed build/run deletes the
-	// descriptor below (the compiler leaves the OLD binary on a compile failure, so
-	// the just-written NEW descriptor would otherwise desync from it). Skipped on the
-	// replay path (cached), which already has a matching descriptor.
+	// Write the descriptor before the build so a new binary is never paired
+	// with an old descriptor if the run later fails. A failed build/run deletes
+	// it, since a compile failure leaves the old binary in place.
 	if !cached {
 		src, rerr := d.renderSource(o.repoRoot, stream)
 		var srcHash string
 		if rerr != nil {
-			// A render failure here will also fail inside buildRun; log and proceed
-			// with an empty hash (the descriptor is deleted if the run then fails).
+			// buildRun will fail too, and then the descriptor is deleted.
 			rec.logf("%s: could not hash driver source for cache descriptor: %v", d.name, rerr)
 		} else {
 			srcHash = sourceHash(src)
@@ -781,16 +644,9 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 		}
 	}
 
-	// Drive the client, retrying a transient pre-warm stall. A pre-warm timeout
-	// (driver exit preWarmExit) is the common INFRA failure: the api served stale
-	// /api/metrics-list during an apple/container journal-longpoll hiccup, so the
-	// driver's seeds never mapped and it bailed before any real write. The stall
-	// is transient and self-recovers, so re-running the driver a moment later
-	// usually clears it. Only preWarmExit is retried — a launch error (runErr) or
-	// any other non-zero exit is a real failure and fails fast. buildRun re-runs
-	// the per-driver build+run script, but the compile caches are volume-mounted
-	// (GOCACHE / rust & cpp object caches), so a repeat build is a cache-warmed
-	// near-no-op; the real cost is the driver's 60s pre-warm poll again.
+	// Only a pre-warm timeout (preWarmExit) is retried: it is a transient
+	// apple/container journal-longpoll stall where the api serves a stale
+	// metrics list. Rebuilds on retry hit the mounted compile caches.
 	prewarmAttempts := 1 + o.prewarmRetries
 	if prewarmAttempts < 1 {
 		prewarmAttempts = 1
@@ -818,7 +674,7 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 		if runErr != nil {
 			rec.logf("FAIL %s: build/run did not launch: %v\n%s", d.name, runErr, indent(output))
 			fmt.Printf("FAIL %s build/run: %v\n", d.tag, runErr)
-			removeStreamCacheDescriptor(rec, d.name, buildCache) // F7: no valid pair from a failed run
+			removeStreamCacheDescriptor(rec, d.name, buildCache)
 			return 0, len(stream.Metrics)
 		}
 		if exitCode == 0 {
@@ -835,7 +691,6 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 			}
 			continue
 		}
-		// Terminal non-zero: pre-warm exhausted its retries, or a different exit.
 		if exitCode == preWarmExit {
 			rec.logf("FAIL %s: pre-warm timed out (metrics never created — agent/agg path down?)\n%s", d.name, indent(output))
 			fmt.Printf("FAIL %s: pre-warm timed out (agent/agg path down?)\n", d.tag)
@@ -843,22 +698,17 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 			rec.logf("FAIL %s: driver exited %d\n%s", d.name, exitCode, indent(output))
 			fmt.Printf("FAIL %s driver exited %d\n", d.tag, exitCode)
 		}
-		removeStreamCacheDescriptor(rec, d.name, buildCache) // F7: no valid pair from a failed run
+		removeStreamCacheDescriptor(rec, d.name, buildCache)
 		return 0, len(stream.Metrics)
 	}
 	rec.logf("%s: driver exited 0\n%s", d.name, indent(truncate(strings.TrimSpace(output), 1200)))
-	// The descriptor was written at build time (above). A clean exit with no cached
-	// binary means the build recipe did not target the cache — logged, not fatal (a
-	// later --skip-client-build then fails with "no driver binary", which is correct).
+	// Not fatal: a later --skip-client-build fails with "no driver binary".
 	if !cached && !fileExists(filepath.Join(buildCache, driverBinName)) {
 		rec.logf("%s: build did not cache a driver binary at %s", d.name, filepath.Join(buildCache, driverBinName))
 	}
 
-	// Silent-loss tripwire: query __src_client_write_err for this
-	// client's run window BEFORE the value assertions, so a TCP-backpressure drop
-	// is reported as one labelled failure rather than N mysterious "count too low"
-	// mismatches whose real cause (bytes never reached the agent) is otherwise
-	// invisible. ok=true also covers clients that do not emit the metric.
+	// Silent-loss tripwire, checked first so a TCP-backpressure drop reads as one
+	// labelled failure rather than N "count too low" mismatches.
 	werrOK, werrDetail := assertNoClientWriteErr(ctx, rec, o.apiAddr, d.tag, statusAnchor)
 	if !werrOK {
 		const werrLabel = "client write-error (silent data loss)"
@@ -871,19 +721,9 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 		failed++ // count the silent-loss failure alongside any value mismatches
 	}
 
-	// rejection statuses (criterion 2), conservation ledger (criteria
-	// 3+5), and the whole-run sampling tripwire (criterion 4). They run AFTER the
-	// visible matrix so any sampling on a queried view is already caught; each
-	// prints its own labelled PASS/FAIL lines inside. Only their FAILURES fold into
-	// the client total — the matrix PASS count (passed) stays at the 17 (metric,
-	// func) pairs, so the run summary still reads "N metric/func assertion(s)"
-	// while the ledger/rejection/sampling lines stand as their own evidence. Their
-	// windows anchor at statusAnchor (realtime builtins), NOT stream.Base.
-	// Poll the shared __src_ingestion_status breakdown ONCE until both the rejection
-	// statuses and the conservation ledger converge (or ledgerTimeout), then render
-	// each criterion from that single converged snapshot. The two used to poll
-	// separately with identical queries; sharing one poll halves the worst-case
-	// wall-clock (one ledgerTimeout budget, not two serial ones).
+	// Rejection statuses, conservation ledger and the sampling tripwire. Only
+	// their failures fold into the total, so passed stays the matrix count. One
+	// shared __src_ingestion_status poll serves both rejections and ledger.
 	ledgerBD, ledgerBody := pollIngestionLedger(ctx, o.apiAddr, stream, statusAnchor)
 	rjPassed, rjFailed := assertRejections(rec, o.apiAddr, d.tag, stream, statusAnchor, ledgerBD, ledgerBody)
 	ldPassed, ldFailed := assertConservationLedger(rec, o.apiAddr, d.tag, stream, statusAnchor, ledgerBD, ledgerBody)
@@ -893,9 +733,7 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 		rec.logf("FAIL %s: %s\n%s", d.name, samplingTripwire, indent(det))
 		fmt.Printf("FAIL %s: %s\n", d.tag, samplingTripwire)
 	} else {
-		// Echo the PASS so the tripwire's success is explicit evidence in the run
-		// log, mirroring the ledger/rejection lines — a silent tripwire is
-		// indistinguishable from one that never ran.
+		// A silent tripwire is indistinguishable from one that never ran.
 		rec.logf("PASS %s: agg sampling tripwire — %s absent/zero across the run", d.name, aggSamplingFactorMetric)
 		fmt.Printf("PASS %s: agg sampling tripwire — __agg_sampling_factor absent\n", d.tag)
 	}
@@ -910,10 +748,7 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 	return passed, failed
 }
 
-// resolveArch picks the GOARCH to cross-compile daemons for. An explicit --arch
-// wins; otherwise runtime.GOARCH — arm64 on the verified macOS/lima paths, amd64
-// on an amd64 Linux box — matching ("detected at preflight, default
-// arm64, overridable … an amd64 Linux box builds amd64").
+// resolveArch picks the daemons' GOARCH: --arch, else the host's.
 func resolveArch(flagArch string) string {
 	if flagArch != "" {
 		return flagArch
@@ -921,12 +756,8 @@ func resolveArch(flagArch string) string {
 	return runtime.GOARCH
 }
 
-// pruneStale removes every e2e-* container and network it can find. Returns the
-// counts removed. Best-effort: errors on individual resources are ignored so one
-// stuck resource doesn't abort the run.
-//
-// The e2e- prefix is shared by every run, so this pruning assumes a single
-// harness run at a time: concurrent runs would delete each other's live stack.
+// pruneStale best-effort removes every e2e-* container and network. The prefix
+// is shared by every run, so concurrent runs would delete each other's stacks.
 func pruneStale(ctx context.Context, rt Runtime) (containers, networks int) {
 	for _, c := range listSafe(ctx, rt.ContainerList) {
 		if strings.HasPrefix(c, e2ePrefix) {
@@ -977,10 +808,8 @@ func resolveAPIAddr(flagVal string) (string, error) {
 }
 
 // checkPublishedPortFree fails when something already answers on the api's
-// host address: two concurrent harness runs collide hard — they prune each
-// other's containers and one run's assertions silently query the other's api —
-// and failing here, before the stack publishes anything, is far cheaper than
-// debugging the cross-talk. A dial error other than success counts as free.
+// host address, so a concurrent run is caught before its assertions silently
+// query the other run's api.
 func checkPublishedPortFree(ctx context.Context, addr string) error {
 	d := net.Dialer{Timeout: 500 * time.Millisecond}
 	if c, err := d.DialContext(ctx, "tcp", addr); err == nil {
@@ -1007,39 +836,28 @@ func repoRoot() (string, error) {
 	}
 }
 
-// recorder captures every progress line for the artifacts summary and prints it
-// to stderr (so PASS/FAIL stdout stays clean for scripting). It also accumulates
-// the raw JSON of every FAILED /api/query (raw JSON of failed queries
-// in the artifacts on every run), and — under -v — the raw JSON of every
-// assertion query (pass or fail), so a verbose run leaves a complete response
-// trail. verbose/artifactsDir are set once in realMain; the failed-query list is
-// guarded by a mutex so the assertion path's appends and the artifact writer's
-// snapshot are safe regardless of how they are scheduled. (The live log streamer
-// does NOT touch this list — it writes daemon log lines straight to stderr — so it
-// is not part of that concurrency.)
+// recorder logs progress lines to stderr (keeping stdout clean for PASS/FAIL)
+// and keeps them for summary.txt, plus the raw responses of failed queries.
 type recorder struct {
 	lines        []string
 	verbose      bool
 	artifactsDir string
-	runID        string // the e2e-<runID>- prefix of THIS run's containers (stripped by serviceLogName)
+	runID        string
 
 	fqMu          sync.Mutex
 	failedQueries []failedQuery
 }
 
-// failedQuery is one /api/query whose result did not satisfy an assertion, with
-// the verbatim response bytes (the exact payload a human needs to diagnose a
-// mismatch without rerunning). Serialized into e2e/test-results/<runid>/failed-
-// queries.json. Body is "" when the query itself errored before any body (e.g.
-// a connection refused); the Label/URL still pinpoints it.
+// failedQuery is one /api/query that failed an assertion, with the verbatim
+// response, dumped to failed-queries.json.
 type failedQuery struct {
-	Label      string `json:"label"`       // "value" / "write_err" / "sampling"
-	Client     string `json:"client"`      // driver tag (go/rust/cpp)
-	Metric     string `json:"metric"`      // metric name (or builtin)
-	Func       string `json:"func"`        // qw (count/sum/p50/…) for value assertions
-	URL        string `json:"url"`         // the exact /api/query URL
+	Label      string `json:"label"`
+	Client     string `json:"client"`
+	Metric     string `json:"metric"`
+	Func       string `json:"func"`
+	URL        string `json:"url"`
 	HTTPStatus int    `json:"http_status"` // 0 when the request itself failed
-	Body       string `json:"body"`        // raw response JSON (verbatim)
+	Body       string `json:"body"`
 }
 
 func (r *recorder) logf(format string, args ...any) {
@@ -1048,8 +866,7 @@ func (r *recorder) logf(format string, args ...any) {
 	fmt.Fprintln(os.Stderr, "[e2e] "+line)
 }
 
-// recordFailedQuery appends one failed query for the artifacts dump. Safe for
-// concurrent use (the assertion polls and the live streamer run concurrently).
+// recordFailedQuery appends one failed query; safe for concurrent use.
 func (r *recorder) recordFailedQuery(fq failedQuery) {
 	if r == nil {
 		return
@@ -1059,8 +876,7 @@ func (r *recorder) recordFailedQuery(fq failedQuery) {
 	r.fqMu.Unlock()
 }
 
-// snapshotFailedQueries returns a copy of the recorded failed queries (nil if
-// none), so the writer can serialize without holding the lock across file I/O.
+// snapshotFailedQueries returns a copy of the recorded failed queries.
 func (r *recorder) snapshotFailedQueries() []failedQuery {
 	if r == nil {
 		return nil
@@ -1076,9 +892,7 @@ func (r *recorder) snapshotFailedQueries() []failedQuery {
 }
 
 // dumpQueryResponse writes one assertion query's raw response to
-// artifacts/queries/<client>__<metric>__<qw>.json. Used under -v so a verbose
-// run leaves the verbatim reply to EVERY assertion query (pass or fail), not
-// only the failing ones. Best-effort: a write error is logged, never fatal.
+// queries/<client>__<metric>__<qw>.json (used under -v). Best-effort.
 func (r *recorder) dumpQueryResponse(clientTag, metric, qw, body string) {
 	if r == nil || r.artifactsDir == "" {
 		return
@@ -1096,11 +910,8 @@ func (r *recorder) dumpQueryResponse(clientTag, metric, qw, body string) {
 	}
 }
 
-// writeFailedQueries writes the recorded failed queries as a JSON array to
-// <artifacts>/failed-queries.json. Called on every run (pass and fail): a clean
-// PASS has no failed queries, so the file is written only when there is at least
-// one (an empty array on a green run would be noise). Always returns nil — a
-// dump failure is logged but must not mask the run result.
+// writeFailedQueries writes failed-queries.json when there is at least one.
+// Best-effort: a failure is logged and must not mask the run result.
 func writeFailedQueries(artifactsDir string, fqs []failedQuery, rec *recorder) {
 	if len(fqs) == 0 {
 		return
@@ -1124,10 +935,7 @@ func writeFailedQueries(artifactsDir string, fqs []failedQuery, rec *recorder) {
 	}
 }
 
-// sanitizeFileName reduces a string to a filename-safe form (the metric name
-// already restricts itself to [A-Za-z0-9_], but the builtin names carry a "__"
-// prefix and the qw/client values are short words; this keeps the dump path
-// predictable on any platform). Path separators and spaces collapse to "_".
+// sanitizeFileName maps every rune outside [A-Za-z0-9_-] to "_".
 func sanitizeFileName(s string) string {
 	if s == "" {
 		return "_"
@@ -1144,10 +952,8 @@ func sanitizeFileName(s string) string {
 	return b.String()
 }
 
-// fail records the failure, dumps every started container's logs to artifacts
-// (so any daemon crash leaves a <service>.log for diagnosis), writes the summary,
-// and returns the exit code. rt is nil before the runtime is selected; containers
-// holds whatever was started before the failure (possibly empty).
+// fail records the failure, dumps the started containers' logs and the
+// artifacts, and returns the exit code. rt is nil before runtime selection.
 func fail(rec *recorder, artifactsDir string, rt Runtime, containers []string, err error) int {
 	msg := fmt.Sprintf("FAIL: %v", err)
 	rec.lines = append(rec.lines, msg)
@@ -1158,10 +964,8 @@ func fail(rec *recorder, artifactsDir string, rt Runtime, containers []string, e
 	return 1
 }
 
-// dumpServiceLogs writes each started container's accumulated logs to
-// <artifacts>/<service>.log (the service name is the last dash-segment of the
-// container name, e.g. e2e-<runid>-metadata -> metadata.log). Best-effort: a
-// capture failure is logged but never masks the run result.
+// dumpServiceLogs writes each still-present container's logs to
+// <artifacts>/<service>.log. Best-effort.
 func dumpServiceLogs(rec *recorder, rt Runtime, containers []string, artifactsDir string) {
 	if rt == nil || len(containers) == 0 {
 		return
@@ -1195,11 +999,9 @@ func dumpServiceLogs(rec *recorder, rt Runtime, containers []string, artifactsDi
 	}
 }
 
-// serviceLogName reduces a container name to its service role. With the run id
-// known it strips e2e-<runid>- and keeps the whole remainder, so the conformance
-// mode's two stacks stay distinct (e2e-<runid>-ch-agg -> ch-agg, ...-duck-agg ->
-// duck-agg); without one (older callers) it falls back to the last dash segment
-// (e2e-<runid>-clickhouse -> clickhouse).
+// serviceLogName strips e2e-<runid>- from a container name, keeping the whole
+// remainder so conformance's ch-agg and duck-agg stay distinct; without a run
+// id it keeps the last dash segment.
 func serviceLogName(container string, runID string) string {
 	if prefix := e2ePrefix + runID + "-"; runID != "" && strings.HasPrefix(container, prefix) {
 		return strings.TrimPrefix(container, prefix)
@@ -1212,27 +1014,18 @@ func serviceLogName(container string, runID string) string {
 
 func writeSummary(artifactsDir string, lines []string) {
 	path := filepath.Join(artifactsDir, "summary.txt")
-	// Best-effort; a failure to write the summary must not mask the real result.
 	_ = os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
 }
 
-// writeRunArtifacts writes BOTH diagnostics artifacts required on
-// every run: the PASS/FAIL summary (always) and the raw JSON of failed queries
-// (when any — a clean PASS has none). Called on the pass path, the fail() path,
-// and the assertion-failure path, so the artifacts dir is complete regardless of
-// where the run stopped.
+// writeRunArtifacts writes summary.txt and, if any, failed-queries.json.
 func writeRunArtifacts(artifactsDir string, rec *recorder) {
 	writeFailedQueries(artifactsDir, rec.snapshotFailedQueries(), rec)
 	writeSummary(artifactsDir, rec.lines)
 }
 
-// startLogStreamer tails every container's logs to stderr while the run proceeds
-// (-v streams logs live). apple/container's `logs` is a one-shot fetch
-// (no -f follow), so this polls each container on an interval and writes the bytes
-// appended since the last fetch, each line prefixed [<service>] to distinguish a
-// daemon log line from the harness's own [e2e] progress lines. Best-effort: any
-// fetch error is swallowed (a transient CLI hiccup must not abort the run). Returns
-// a stop func that cancels the tail goroutine; the caller stops it before teardown.
+// startLogStreamer tails container logs to stderr, each line prefixed
+// [<service>]. apple/container's `logs` has no -f, so it polls and prints the
+// bytes appended since the last fetch. Fetch errors are ignored.
 func startLogStreamer(ctx context.Context, rt Runtime, containers []string, runID string) (stop func()) {
 	sctx, cancel := context.WithCancel(ctx)
 	var once sync.Once

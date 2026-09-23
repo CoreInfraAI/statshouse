@@ -9,24 +9,19 @@ import (
 	"time"
 )
 
-// containerRuntime shells out to apple/container (macOS). The CLI version is
-// pinned (see CheckVersion) because it drifts per release. Verified against CLI
-// v1.2.0 on this machine.
+// containerRuntime shells out to apple/container (macOS), whose CLI version is
+// pinned because it drifts per release.
 type containerRuntime struct{}
 
 const pinnedContainerVersion = "1.2.0"
 
 func (r *containerRuntime) Name() string { return "container" }
 
-// HasNetworkEgress: apple/container has no in-container network, so the --with-ui
-// build is driven from a host-populated offline cache rather than an online npm
-// install. See Runtime.HasNetworkEgress.
 func (r *containerRuntime) HasNetworkEgress() bool { return false }
 
 func (r *containerRuntime) EnsureSystem(ctx context.Context) error {
 	out, err := runOK(ctx, "container", "system", "status")
 	if err != nil {
-		// Status command itself failed; try to start the services and re-check.
 		return r.startAndVerify(ctx)
 	}
 	if !statusRunning(out) {
@@ -76,8 +71,7 @@ func (r *containerRuntime) CheckVersion(ctx context.Context) error {
 	return checkContainerVersion(ver)
 }
 
-// checkContainerVersion is the pure version-pin check, separated so the mismatch
-// path is testable without faking the CLI.
+// checkContainerVersion is split out so the mismatch path is testable.
 func checkContainerVersion(parsed string) error {
 	if parsed != pinnedContainerVersion {
 		return fmt.Errorf("apple/container CLI version %q does not match pinned %q — CLI drift can break the harness; update the pin or install %s",
@@ -147,8 +141,7 @@ func (r *containerRuntime) Run(ctx context.Context, opts RunOpts) error {
 func (r *containerRuntime) Exec(ctx context.Context, id string, cmd []string) (string, int, error) {
 	args := append([]string{"exec", id}, cmd...)
 	res, err := run(ctx, "container", args...)
-	// Combine stdout and stderr so clickhouse-client errors (written to stderr)
-	// appear in probe output and failure diagnostics.
+	// clickhouse-client writes errors to stderr; keep them in probe output.
 	return res.stdout + res.stderr, res.exitCode, err
 }
 

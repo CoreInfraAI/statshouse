@@ -7,11 +7,8 @@ import (
 	"testing"
 )
 
-// TestQuantileUniform pins the type-7 linear-interpolation values the value_p
-// assertions compare the t-digest against. For the uniform integers 0..999
-// (the spec's "0–999 step 1" distribution) the true quantiles are exact and
-// known: pos=q·(n-1), interpolated. Any change to quantile() that shifts these
-// would silently change the assertion's "truth" and must surface here.
+// TestQuantileUniform pins the type-7 quantiles the value_p assertions treat as
+// truth; a shift here would silently change every percentile expectation.
 func TestQuantileUniform(t *testing.T) {
 	xs := genValueUniform(1000) // 0..999, already sorted
 	cases := []struct {
@@ -31,9 +28,6 @@ func TestQuantileUniform(t *testing.T) {
 	}
 }
 
-// TestQuantileOfUnsorted confirms quantileOf sorts before interpolating: the
-// skewed LCG sequence is not ordered, yet its median must equal the median of
-// the same values sorted by hand.
 func TestQuantileOfUnsorted(t *testing.T) {
 	xs := []float64{3, 1, 4, 1, 5, 9, 2, 6}
 	sorted := append([]float64(nil), xs...)
@@ -43,9 +37,7 @@ func TestQuantileOfUnsorted(t *testing.T) {
 	}
 }
 
-// TestQuantileEdge covers degenerate inputs so the asserter never divides by
-// zero or indexes out of range: empty → NaN (caller bug, not a silent 0),
-// single → that value, q clamped to [0,1].
+// TestQuantileEdge: empty is NaN (a caller bug, not a silent 0); q is clamped.
 func TestQuantileEdge(t *testing.T) {
 	if q := quantile(nil, 0.5); !math.IsNaN(q) {
 		t.Errorf("quantile(empty) = %g, want NaN", q)
@@ -59,14 +51,11 @@ func TestQuantileEdge(t *testing.T) {
 	}
 }
 
-// TestGenValueSkewedDeterministic pins the skewed generator's first few values.
-// These EXACT bytes are what every client driver loop must reproduce: if the
-// harness and a driver ever diverge (a constants/overflow typo), the value_p
-// assertions compare against the wrong "truth" and a real t-digest error would
-// be masked. The values here are the reference computed from the shared LCG.
+// TestGenValueSkewedDeterministic: every client driver must reproduce these
+// exact values, or value_p assertions compare against the wrong truth.
 func TestGenValueSkewedDeterministic(t *testing.T) {
 	got := genValueSkewed(4)
-	// Reproduce by hand from lcgSeed to lock the formula.
+	// Reproduce by hand from lcgSeed.
 	x := lcgSeed
 	var want []float64
 	for i := 0; i < 4; i++ {
@@ -77,8 +66,7 @@ func TestGenValueSkewedDeterministic(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("genValueSkewed(4)=%v, want %v", got, want)
 	}
-	// The skew is real: the median of a large sample is well below the midpoint
-	// of the range (mass concentrates near 0).
+
 	big := genValueSkewed(4000)
 	med := quantileOf(big, 0.5)
 	if med > 350 { // uniform midpoint would be ~ (999²/1000)/2 ≈ 499
@@ -86,7 +74,6 @@ func TestGenValueSkewedDeterministic(t *testing.T) {
 	}
 }
 
-// TestGenValueUniformAndUnique pins the trivial generators' length and content.
 func TestGenValueUniformAndUnique(t *testing.T) {
 	u := genValueUniform(5)
 	if !reflect.DeepEqual(u, []float64{0, 1, 2, 3, 4}) {
@@ -98,22 +85,19 @@ func TestGenValueUniformAndUnique(t *testing.T) {
 	}
 }
 
-// TestWithinTol covers both tolerance bands the assertions depend on: the
-// percentile absolute+relative band and the unique relative band, including the
-// near-zero-truth floor that keeps a tiny true quantile usable.
 func TestWithinTol(t *testing.T) {
-	// Percentile: max(1%·|truth|, 1.0). truth=499.5 → tol 4.995.
+	// Percentile: max(1%·|truth|, 1.0).
 	if !withinAbsTol(502, 499.5, 0.01, 1.0) {
 		t.Error("502 should be within 1% of 499.5")
 	}
 	if withinAbsTol(510, 499.5, 0.01, 1.0) {
 		t.Error("510 should be OUTSIDE 1% of 499.5")
 	}
-	// Near-zero truth: floor 1.0 binds, so ±1 is accepted.
+	// Near-zero truth: the 1.0 floor binds.
 	if !withinAbsTol(0.9, 0, 0.01, 1.0) {
 		t.Error("0.9 should be within the 1.0 floor of truth 0")
 	}
-	// Unique ±2%: truth=100000 → tol 2000.
+
 	if !withinRelTol(101500, 100000, 0.02) {
 		t.Error("101500 should be within 2% of 100000")
 	}

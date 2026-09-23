@@ -12,48 +12,29 @@ import (
 	"time"
 )
 
-// This file implements assertions for the FULL metric stream, polling
-// /api/query (w=1, ac=1) per (metric, query-function) until the expected series
-// appear, then asserting per-bucket, per-(metric, tag-set)-series equality —
-// exact for counter/value/unique-small/stag, within a tolerance band for
-// value_p percentiles and the big-unique estimate — with the §4 normalization
-// (strip the go _h host tag, drop empty-valued tags — already applied to the
-// expected model — and ignore client meta-metrics, which never collide with the
-// e2e_<runID>_ prefix).
+// Stream assertions: poll /api/query per (metric, query function) until the
+// expected series appear, then compare per bucket and per series — exactly,
+// or within a tolerance band for percentiles and the big-unique estimate.
 
-// assertTimeout is the worst-case poll window for one (metric, func) to
-// converge. The historic conveyor is ~24s end-to-end; 60s leaves headroom for
-// auto-create, agg insertion, and the big-unique bucket flush.
+// assertTimeout is the poll window for one (metric, func). The conveyor takes
+// ~24s end-to-end; the rest is headroom for auto-create and the big-unique flush.
 const assertTimeout = 60 * time.Second
 
-// percentileTol / percentileMinAbs are the value_p tolerance band: an
-// API percentile is accepted when |actual-truth| ≤ max(percentileTol·|truth|,
-// percentileMinAbs). percentileTol is the spec's 1% relative band; percentileMinAbs
-// is the absolute floor so a near-zero true quantile still has a usable band. The
-// t-digest's quantile error is bounded by ~1/compression in quantile space (agent
-// compression=40), comfortably inside 1% — ON A FLAT DENSITY. On the skewed
-// generator (value=1000·r², mass near 0) the inverse CDF is steep — at p50
-// dv/dq = 2·√(1000·v) ≈ 1000 — so a sub-1% quantile-space wobble becomes a
-// >1% VALUE-space deviation. Observed live (identical data, count/sum/min/max
-// exact): p50 −1.48%/+1.09%, p90 +1.94%, each on ONE bucket of 70, roughly one
-// run in three. percentileSkewTol is the widened band those series are held to;
-// uniform series and the duck-vs-CH differential keep the 1% band.
+// value_p tolerance band (see withinAbsTol). The t-digest error is ~1/compression
+// in quantile space, inside 1% on a flat density. On the skewed generator the
+// inverse CDF is steep (dv/dq ≈ 1000 at p50), so quantile-space error grows past
+// 1% in value space (observed up to ~2%); skewed series get percentileSkewTol.
 const (
 	percentileTol     = 0.01
 	percentileSkewTol = 0.05
 	percentileMinAbs  = 1.0
 )
 
-// uniqueApproxTol is the big-unique ±relative band (>65536 distinct → ChUnique
-// thinning estimator, 1σ≈0.45%, so ±2% is ~4σ).
+// uniqueApproxTol is the big-unique relative band (~4σ of ChUnique's estimator).
 const uniqueApproxTol = 0.02
 
-// apiSeriesResponse mirrors the minimal slice of the API's query reply. The
-// payload is wrapped under a top-level "data" key; series lives at data.series.
-// SeriesData is [][]float64: the API marshals a missing point (NaN) as JSON null,
-// which encoding/json turns into 0.0 — and every expected value is non-zero
-// (counts ≥1, value aggregates over ≥1 value, cardinality ≥1, unique ≥1), so a 0
-// is an unambiguous failure.
+// apiSeriesResponse mirrors the used slice of the API's query reply. A missing
+// point (JSON null) decodes as 0, which no expected value is.
 type apiSeriesResponse struct {
 	Data apiResponseData `json:"data"`
 }
@@ -78,9 +59,8 @@ type apiMetaTag struct {
 	Value string `json:"value"`
 }
 
-// queryFunc is one (function, quantile) the harness queries a metric with. qw is
-// the API query-function string; q is the quantile arg for percentile funcs
-// (unused otherwise). label decorates the PASS/FAIL line.
+// queryFunc is one query function a metric is asserted with; q is the quantile
+// for percentile functions.
 type queryFunc struct {
 	qw    string
 	q     float64
@@ -91,8 +71,7 @@ type queryFunc struct {
 func funcsFor(kind string) []queryFunc {
 	switch kind {
 	case kindCounter, kindStag:
-		// stag asserts cardinality; counter asserts count. Both are single-func,
-		// exact, group-by-or-not depending on QBKeys.
+		// stag asserts cardinality; counter asserts count.
 		return []queryFunc{{qw: qwFor(kind), label: qwFor(kind)}}
 	case kindValue:
 		return []queryFunc{
@@ -121,15 +100,9 @@ func qwFor(kind string) string {
 	return "count"
 }
 
-// assertStream polls and asserts every metric in the stream across all of its
-// query functions. Returns pass/fail counts; each (metric, func) yields exactly
-// one PASS or FAIL line labelled with the client tag (the per-client metric-name
-// prefix already isolates clients; the tag makes the line readable). want is the
-// per-metric sentWrites the conservation ledger balances against (precomputed by
-// ledgerWriteCounts); it lets a FAILED value assertion also print that metric's
-// ledger state, so a value mismatch and its likely cause (silent loss vs double-
-// count) are visible in one place (the conservation ledger for that
-// metric).
+// assertStream asserts every metric across its query functions, one PASS or
+// FAIL line per (metric, func). A failure also prints the metric's ledger
+// state, so a mismatch and its likely cause read together.
 func assertStream(ctx context.Context, rec *recorder, apiAddr, clientTag string, stream metricStream) (passed, failed int) {
 	want := ledgerWriteCounts(stream)
 	for _, m := range stream.Metrics {
@@ -150,13 +123,9 @@ func assertStream(ctx context.Context, rec *recorder, apiAddr, clientTag string,
 	return passed, failed
 }
 
-// pollMetricFunc queries one (metric, func) repeatedly until it matches the
-// expected model or assertTimeout elapses. detail is the last observed failure.
-// On failure it ALSO records the raw /api/query response on the recorder (so the
-// run artifacts carry the verbatim JSON of every failed query), writes
-// the final response to artifacts under -v, and appends the metric's conservation
-// ledger state (sentWrites drives the balance verdict) so a mismatch and its
-// probable cause read together.
+// pollMetricFunc queries one (metric, func) until it matches or assertTimeout
+// elapses. On failure it records the raw response and appends the metric's
+// ledger line to the returned detail.
 func pollMetricFunc(ctx context.Context, rec *recorder, apiAddr, clientTag string, m metricModel, base uint32, sentWrites int, qf queryFunc) (bool, string) {
 	qurl := metricQueryURL(apiAddr, m.Name, m.QBKeys, qf.qw, base)
 	var (
@@ -172,24 +141,18 @@ func pollMetricFunc(ctx context.Context, rec *recorder, apiAddr, clientTag strin
 			return false, nil
 		}
 		mismatches, missing, extras, sampling := compareByFunc(m, resp, qf)
-		// All four must be clean: exact/tolerant values, no missing series, no
-		// extra series, and no sampling (a nonzero sampling factor means data was
-		// sampled and must fail even when the values happen to match).
+		// Sampled data fails even when the values happen to match.
 		if len(mismatches) == 0 && len(missing) == 0 && len(extras) == 0 && sampling == 0 {
 			return true, nil
 		}
 		lastDetail = formatFail(m.Name, qurl, qf, mismatches, missing, extras, sampling)
 		return false, nil
 	}); err != nil {
-		// A cancelled context (the run deadline or a signal) is not a value
-		// mismatch: bail BEFORE recording a spurious failed-query or fetching the
-		// ledger (which would itself error under the cancelled ctx and emit a
-		// misleading "ledger: unavailable" line). The run is already tearing down.
+		// A cancelled run is not a mismatch; skip the failure diagnostics.
 		if ctx.Err() != nil {
 			return false, ""
 		}
-		// Timed out still mismatched → record the verbatim response and annotate
-		// with the metric's ledger state, then surface the detail.
+		// Timed out still mismatched.
 		if rec != nil {
 			rec.recordFailedQuery(failedQuery{
 				Label: "value", Client: clientTag, Metric: m.Name, Func: qf.label,
@@ -202,20 +165,16 @@ func pollMetricFunc(ctx context.Context, rec *recorder, apiAddr, clientTag strin
 		lastDetail += "\n" + metricLedgerLine(ctx, apiAddr, base, m.Name, sentWrites)
 		return false, lastDetail
 	}
-	// Matched: under -v keep the verbatim response that satisfied the assertion.
+	// Under -v keep the response that satisfied the assertion.
 	if rec != nil && rec.verbose {
 		rec.dumpQueryResponse(clientTag, m.Name, qf.label, lastBody)
 	}
 	return true, ""
 }
 
-// metricLedgerLine returns a one-line snapshot of one metric's conservation
-// ledger state for embedding in a value-assertion failure. It is a DIAGNOSTIC
-// aid (the authoritative balance check is assertConservationLedger): the values
-// are whatever has landed so far, so a "silent loss" verdict here is a strong
-// hint, not a final ruling. sentWrites==0 marks a metric outside the ledger's
-// exact scope (multi-value kinds, where item count ≠ write count). Pure callers
-// (tests) use formatLedgerLine; this wrapper does the live fetch.
+// metricLedgerLine fetches a diagnostic snapshot of one metric's ledger for a
+// value-assertion failure; assertConservationLedger is authoritative.
+// sentWrites==0 marks a metric outside the ledger's scope.
 func metricLedgerLine(ctx context.Context, apiAddr string, base uint32, name string, sentWrites int) string {
 	if sentWrites == 0 {
 		return "ledger: not balance-checked (multi-value metric / no ledger-eligible writes)"
@@ -228,15 +187,11 @@ func metricLedgerLine(ctx context.Context, apiAddr string, base uint32, name str
 	return formatLedgerLine(sentWrites, okCached, errSum)
 }
 
-// ledgerSnapshotCaveat is appended to a NON-balanced inline ledger line. That line
-// is embedded in a VALUE-assertion failure by metricLedgerLine, which runs BEFORE
-// the authoritative assertConservationLedger poll converges — so its "silent loss"
-// / "over-counted" verdict is a point-in-time snapshot, not a final ruling (the
-// ledger assertion is authoritative). A balanced line needs no caveat.
+// ledgerSnapshotCaveat marks an unbalanced inline ledger line as a snapshot
+// taken before the ledger assertion converged.
 const ledgerSnapshotCaveat = " (snapshot at assertion time; the ledger assertion is authoritative)"
 
 // formatLedgerLine renders the conservation equation verdict for one metric.
-// Pure → unit-tested (TestFormatLedgerLine).
 func formatLedgerLine(sentWrites int, okCached, errSum float64) string {
 	got := okCached + errSum
 	switch {
@@ -251,18 +206,14 @@ func formatLedgerLine(sentWrites int, okCached, errSum float64) string {
 	}
 }
 
-// metricQueryURL builds GET /api/query for one metric at 1s LOD over its buckets.
-// qb is repeated per group-by tag key; an empty qb (stag cardinality) yields a
-// single total series (GROUP BY _time only). "1s" defeats auto-resolution; ac=1
-// defeats the ~1s query cache.
+// metricQueryURL builds GET /api/query for one metric at 1s LOD over its
+// buckets; an empty qb yields a single total series, and ac=1 bypasses the cache.
 func metricQueryURL(apiAddr, name string, qb []string, qw string, base uint32) string {
 	q := url.Values{}
 	q.Set("s", name)
 	q.Set("f", strconv.FormatUint(uint64(base), 10))
 	q.Set("t", strconv.FormatUint(uint64(base+numBuckets), 10))
-	// "1s" (not bare "1"): a bare width is parsed as screen-width=1 → auto-
-	// resolution collapsing the range to ~1 point at the 1m table; the "s" suffix
-	// makes it an explicit 1-second step so the 1s table (statshouse_v6_1s) is used.
+	// A bare "1" means screen width 1 (auto-resolution); "1s" is a 1-second step.
 	q.Set("w", "1s")
 	q.Set("ac", "1")
 	q.Set("qw", qw)
@@ -272,12 +223,8 @@ func metricQueryURL(apiAddr, name string, qb []string, qw string, base uint32) s
 	return "http://" + apiAddr + "/api/query?" + q.Encode()
 }
 
-// queryCounterRaw is queryCounter that ALSO returns the raw response body and
-// HTTP status. The raw body is what the diagnostics artifacts (failed-queries
-// JSON, the -v per-query response dump) need: a re-formatted struct loses the
-// exact bytes the API returned, which is precisely what a human diagnosing a
-// mismatch wants verbatim. status/body are populated even on a parse error so
-// the failure dump carries the offending payload. Pure callers use queryCounter.
+// queryCounterRaw is queryCounter that also returns the raw body and HTTP
+// status for the diagnostics artifacts, even on a parse error.
 func queryCounterRaw(ctx context.Context, qurl string) (resp *apiSeriesResponse, body string, status int, err error) {
 	body, status, err = httpGet(ctx, qurl)
 	if err != nil {
@@ -323,9 +270,7 @@ type seriesMismatch struct {
 	actual    float64
 }
 
-// compareByFunc dispatches to the kind-appropriate comparator. mismatches/
-// missing/extras are empty on a match; sampling is the sum of the two sampling
-// factors (must be 0).
+// compareByFunc dispatches to the kind's comparator; sampling must be 0.
 func compareByFunc(m metricModel, resp *apiSeriesResponse, qf queryFunc) (mismatches []seriesMismatch, missing, extras []string, sampling float64) {
 	switch {
 	case qf.qw == "count":
@@ -346,8 +291,7 @@ func compareByFunc(m metricModel, resp *apiSeriesResponse, qf queryFunc) (mismat
 	return mismatches, missing, extras, sampling
 }
 
-// compareCounts is the counter exact per-series count comparison (bidirectional:
-// a never-written series is as much a failure as a missing one).
+// compareCounts compares counts exactly per series, in both directions.
 func compareCounts(m metricModel, resp *apiSeriesResponse) (mismatches []seriesMismatch, missing, extras []string) {
 	actual := indexResponse(resp)
 	want := make(map[string]bool, len(m.Series))
@@ -369,15 +313,13 @@ func compareCounts(m metricModel, resp *apiSeriesResponse) (mismatches []seriesM
 	return mismatches, missing, extras
 }
 
-// compareCardinality is the stag assertion: with NO group-by the API returns one
-// series (signature "") whose per-bucket value is the distinct-series count
-// (sum(1)). Expected = the number of series that wrote the bucket (all of them,
-// for stag). Exact.
+// compareCardinality asserts stag: with no group-by the API returns one series
+// (signature "") whose value is the distinct-series count per bucket.
 func compareCardinality(m metricModel, resp *apiSeriesResponse) (mismatches []seriesMismatch, missing, extras []string) {
 	actual := indexResponse(resp)
 	got, ok := actual[""]
 	if !ok {
-		// The total series itself is absent → flag every populated bucket missing.
+		// The total series is absent: every populated bucket is missing.
 		for bucket := range stagBuckets(m) {
 			missing = append(missing, fmt.Sprintf("cardinality total absent at bucket %d", bucket))
 		}
@@ -388,7 +330,7 @@ func compareCardinality(m metricModel, resp *apiSeriesResponse) (mismatches []se
 			mismatches = append(mismatches, seriesMismatch{"(cardinality)", bucket, strconv.Itoa(expCount), got[bucket]})
 		}
 	}
-	// Any series besides the "" total is unexpected (cardinality returns one).
+	// Any series besides the "" total is unexpected.
 	for sig := range actual {
 		if sig != "" {
 			extras = append(extras, sig)
@@ -397,10 +339,7 @@ func compareCardinality(m metricModel, resp *apiSeriesResponse) (mismatches []se
 	return mismatches, missing, extras
 }
 
-// stagBuckets maps every bucket a stag series populates to the expected distinct-
-// series count there. All stag series write all buckets, so every populated
-// bucket expects len(m.Series); the set of buckets is the union of all series'
-// Counts keys.
+// stagBuckets maps every populated stag bucket to its expected series count.
 func stagBuckets(m metricModel) map[uint32]int {
 	out := map[uint32]int{}
 	for _, es := range m.Series {
@@ -411,10 +350,8 @@ func stagBuckets(m metricModel) map[uint32]int {
 	return out
 }
 
-// compareValueAgg is the value exact per-series aggregate comparison. The
-// expected sum/min/max/avg are computed from the model's merged values in WRITE
-// ORDER (the same left-fold the agent's ValueSum uses), so the float64 result is
-// bit-identical and compared with ==.
+// compareValueAgg compares value aggregates exactly: the model folds in write
+// order like the agent, so the floats are bit-identical.
 func compareValueAgg(m metricModel, resp *apiSeriesResponse, qw string) (mismatches []seriesMismatch, missing, extras []string) {
 	actual := indexResponse(resp)
 	want := make(map[string]bool, len(m.Series))
@@ -437,11 +374,8 @@ func compareValueAgg(m metricModel, resp *apiSeriesResponse, qw string) (mismatc
 	return mismatches, missing, extras
 }
 
-// comparePercentile is the value_p tolerance comparison: each series' per-bucket
-// API percentile must fall within max(percentileTol·|truth|, percentileMinAbs) of
-// the true quantile (model Values are stored sorted). Skew-generator series use
-// percentileSkewTol instead — see the constants above for why their value-space
-// band must be wider.
+// comparePercentile checks each bucket's percentile against the true quantile
+// of the sorted model values within the percentile tolerance band.
 func comparePercentile(m metricModel, resp *apiSeriesResponse, q float64) (mismatches []seriesMismatch, missing, extras []string) {
 	actual := indexResponse(resp)
 	want := make(map[string]bool, len(m.Series))
@@ -468,9 +402,8 @@ func comparePercentile(m metricModel, resp *apiSeriesResponse, q float64) (misma
 	return mismatches, missing, extras
 }
 
-// compareUnique is the unique comparison: exact equality for the small case
-// (distinct ≤ 65536 → ChUnique exact), ±uniqueApproxTol for the big case
-// (>65536 → thinning estimator).
+// compareUnique compares uniques exactly up to ChUnique's exact threshold and
+// within ±uniqueApproxTol above it.
 func compareUnique(m metricModel, resp *apiSeriesResponse) (mismatches []seriesMismatch, missing, extras []string) {
 	actual := indexResponse(resp)
 	want := make(map[string]bool, len(m.Series))
@@ -483,7 +416,7 @@ func compareUnique(m metricModel, resp *apiSeriesResponse) (mismatches []seriesM
 			continue
 		}
 		for ts, exp := range es.Uniques {
-			approx := exp > uniquesHashMaxSize // big-unique → thinning estimator
+			approx := exp > uniquesHashMaxSize
 			truth := float64(exp)
 			match := !approx && got[ts] == truth
 			if approx {
@@ -502,15 +435,12 @@ func compareUnique(m metricModel, resp *apiSeriesResponse) (mismatches []seriesM
 	return mismatches, missing, extras
 }
 
-// uniquesHashMaxSize is the exact→approximate threshold in ChUnique
-// (internal/data_model/ch_unique.go: 1<<(17-1)). Replicated here so the asserter
-// picks equality vs the ±band without importing data_model.
+// uniquesHashMaxSize is ChUnique's exact→approximate threshold, replicated to
+// avoid importing data_model.
 const uniquesHashMaxSize = 1 << 16
 
-// valueAggregate computes the expected value-kind aggregate over vals in write
-// order. sum is a left fold (matches the agent's ValueSum); avg = sum/len (the
-// agent defaults count to len(values), so avg = sum/count). All exact for these
-// deterministic inputs.
+// valueAggregate computes the expected aggregate over vals in write order; avg
+// is sum/len because the agent defaults count to len(values).
 func valueAggregate(vals []float64, qw string) float64 {
 	switch qw {
 	case "min":
@@ -587,22 +517,9 @@ func formatFail(name, qurl string, qf queryFunc, mismatches []seriesMismatch, mi
 }
 
 // tagSignature is the normalized identity of an API series: sorted "k=v" pairs
-// with (a) the go client's _h host tag stripped — it is never in the harness's
-// qb (stripped defensively), and (b) empty-valued tags dropped. The
-// drop mirrors the expected-model normalizeTags: go drops empty tags client-side,
-// but rust/cpp SEND them verbatim (their libraries have no empty-drop). The agent
-// maps an empty tag value to nothing (internal/agent/agent_mapping.go:
-// len(v.Value)==0 case body is empty), so an empty tag is a no-op on the wire,
-// but the API may still surface it in series_meta — dropping it here keeps the
-// rust/cpp signature equal to the (empty-free) expected signature.
-//
-// (c) An absent group-by (qb) tag position — a series written with fewer tags
-// than qb covers — is materialized by the API as the sentinel value " 0" (tag
-// value ID 0, rendered with a leading space). The expected model has no entry
-// for an absent position, so the sentinel is dropped too; the present tags alone
-// distinguish every series. No harness metric uses "0" as a real tag value, so
-// TrimSpace=="0" never over-drops. (Empty "" is the other absent rendering; it is
-// already caught by the empty-value drop above.)
+// without the _h host tag, empty values (rust/cpp send them verbatim) or the
+// " 0" sentinel the API renders for an absent group-by position. No harness
+// metric uses "0" as a real tag value.
 func tagSignature(tags map[string]apiMetaTag) string {
 	keys := make([]string, 0, len(tags))
 	for k, v := range tags {
@@ -625,10 +542,8 @@ func tagSignature(tags map[string]apiMetaTag) string {
 	return strings.Join(parts, ";")
 }
 
-// expectedSignature mirrors tagSignature for a normalized expected series. The
-// generator's tag keys are positional index strings ("0".."5"); the API emits the
-// legacy tag ID "key"+index ("key0".."key5") as the series_meta map key
-// (internal/format TagIDLegacy), so the index is prefixed here to match.
+// expectedSignature mirrors tagSignature for an expected series; the API keys
+// series_meta by legacy tag ID ("key0".."key5").
 func expectedSignature(tags []tag) string {
 	cp := append([]tag(nil), tags...)
 	sort.Slice(cp, func(i, j int) bool { return cp[i].Key < cp[j].Key })
@@ -641,60 +556,29 @@ func expectedSignature(tags []tag) string {
 
 // --- silent client-side loss tripwire (TCP backpressure) -------------
 
-// clientWriteErrMetric is the builtin every StatsHouse client emits when it
-// SILENTLY drops bytes to the agent under TCP backpressure. The pinned go
-// client's tcpConn.Write (client_conn.go) is a non-blocking send into a
-// 512-packet channel (tcpConnBucketCount); on a would-block it drops the packet
-// and reports the dropped byte count here (reportWouldBlockIfAny). The rust
-// (append_write_err_metric) and cpp (report_would_block_metric_after_send)
-// transports do the same on their own overflow paths. The dropped bytes never
-// reach the agent, so the value assertions would otherwise see mysteriously-low
-// counts with no cause — this tripwire turns that silent loss into one labelled,
-// attributed failure instead. (internal/format/builtin_metrics.go:
-// BuiltinMetricMetaClientWriteError; the clients tag lang at positional index 1
-// and cause "would_block" at index 2.)
+// clientWriteErrMetric is the builtin every client emits with the byte count
+// it drops under TCP backpressure; without this tripwire that loss would show
+// up only as unexplained low counts. Tag 1 is the client language.
 const clientWriteErrMetric = "__src_client_write_err"
 
-// clientWriteErrLang maps a driver tag to the lang code its client writes on
-// __src_client_write_err at tag index 1 (golang=1, rust=3, cpp=5 — confirmed in
-// the pinned sources: go fillTag(&k,"1","1"), rust .tag("1","3"), cpp
-// kb.tag("1","5")). Grouping the query by tag index 1 (qb=1) isolates one
-// client's loss from the other two, which run as separate sequential phases
-// against the shared stack. A client absent here does not emit the metric and is
-// skipped (assertNoClientWriteErr returns ok=true at once); none of the three
-// currently does, but the map keeps that skip path real rather than dead code.
+// clientWriteErrLang maps a driver tag to the language code its client writes
+// at tag 1, which isolates one client's loss on the shared stack.
 var clientWriteErrLang = map[string]string{
 	"go":   "1",
 	"rust": "3",
 	"cpp":  "5",
 }
 
-// writeErrTimeout bounds the absence poll. A dropped-bytes point is a REALTIME
-// write (its ts is the driver's wall-clock burst, ≈ base+120 since base is
-// floor(now)−120), and the historic conveyor lands it in ClickHouse ~24s after
-// the burst. This runs after the driver exits (the burst is already several
-// seconds in the past) and after waitAggConveyor proved the agent→agg→api
-// conveyor live, so 30s comfortably covers the remaining drain. A non-zero point
-// fails at the iteration it appears in — no full wait on red.
+// writeErrTimeout bounds the absence poll. It runs after the driver exits and
+// the conveyor (~24s) is proven live, so 30s covers the remaining drain.
 const writeErrTimeout = 30 * time.Second
 
-// absenceQueryFunc is the injectable shape of ONE absence-poll query, so the
-// fail-closed tripwire logic is unit-testable without a live API. It returns the
-// largest per-bucket value seen on this query (the candidate "violation"
-// magnitude) and an error when the query itself failed (api busy, auth, schema
-// drift, …). A clean (err==nil) result — even one that finds only zeros — counts
-// as a successful observation of absence.
+// absenceQueryFunc is one absence-poll query, returning the largest value seen.
+// A clean result, even all zeros, counts as an observation of absence.
 type absenceQueryFunc func(ctx context.Context) (worst float64, err error)
 
-// absenceOutcome is the result of a fail-closed absence poll.
-//
-//   - ok=true iff absence was confirmed by at least one CLEAN query over the window.
-//   - worst is the largest value seen across clean queries (the violation magnitude
-//     when a non-zero point surfaced; 0 when absent).
-//   - confirmed reports whether at least one query returned without error. false over
-//     the whole window means absence was NEVER observed — the tripwire fails closed.
-//   - queryErr is the last query error (set when !confirmed, for the fail-closed
-//     detail).
+// absenceOutcome is the result of a fail-closed absence poll: confirmed means
+// at least one query succeeded; queryErr is the last error when none did.
 type absenceOutcome struct {
 	ok        bool
 	worst     float64
@@ -702,16 +586,9 @@ type absenceOutcome struct {
 	queryErr  error
 }
 
-// pollAbsenceTripwire drives a FAIL-CLOSED absence assertion: a metric that must
-// stay ABSENT/zero is queried every interval until either a violation surfaces
-// (fail fast) or the timeout elapses with at least one CLEAN query confirming
-// absence (pass). The fail-closed guarantee mirrors the conservation ledger: if
-// EVERY query errors for the whole window — api down, wrong address, auth, schema
-// drift — then absence was never actually confirmed, so the tripwire returns
-// ok=false with confirmed=false rather than silently passing. A safety assertion
-// must never pass on zero successful observations; the old code's "every error →
-// keep polling → timeout → PASS" path did exactly that (a false PASS when, e.g.,
-// the api never came up).
+// pollAbsenceTripwire polls a metric that must stay zero until a violation
+// surfaces or the timeout elapses. It fails closed: if every query errors,
+// absence was never observed and the tripwire does not pass.
 func pollAbsenceTripwire(ctx context.Context, timeout, interval time.Duration, query absenceQueryFunc) absenceOutcome {
 	var (
 		lastErr   error
@@ -722,45 +599,35 @@ func pollAbsenceTripwire(ctx context.Context, timeout, interval time.Duration, q
 		v, qerr := query(ctx)
 		if qerr != nil {
 			lastErr = qerr
-			return false, nil // keep polling; absence is unconfirmed while the query fails
+			return false, nil
 		}
 		confirmed = true
 		if v > worst {
 			worst = v
 		}
-		return worst > 0, nil // a non-zero point → stop (fail); stays false while absent
+		return worst > 0, nil
 	})
 	if err == nil {
-		// poll returned nil → the condition fired → a non-zero point surfaced.
+		// A non-zero point surfaced.
 		return absenceOutcome{ok: false, worst: worst, confirmed: true}
 	}
 	if !confirmed {
-		// Timed out (or ctx cancelled) WITHOUT one clean query: absence was never
-		// confirmed. Fail closed — never pass a safety check on zero data.
+		// No clean query: absence was never confirmed.
 		return absenceOutcome{ok: false, confirmed: false, queryErr: lastErr}
 	}
-	// Timed out (or ctx cancelled) AFTER at least one clean query saw only zero →
-	// ABSENT → the tripwire holds.
+	// At least one clean query saw only zeros.
 	return absenceOutcome{ok: true, worst: worst, confirmed: true}
 }
 
-// assertNoClientWriteErr is the silent-loss tripwire: after a driver exits, poll
-// __src_client_write_err for the client's language over this run's window and
-// fail (ok=false, with a labelled detail) the moment a non-zero point appears.
-// ok=true means a clean query confirmed no loss within writeErrTimeout. The window
-// is [statusAnchor, statusAnchor+200]: __src_client_write_err is a REALTIME builtin
-// recorded at the driver's wall-clock write, so it anchors at client-phase start
-// (statusAnchor), NOT the historic base — a --skip-client-build replay keeps an OLD
-// base while the dropped bytes land at replay-now (F1). 200s absorbs build+run+the
-// historic conveyor with clock-skew headroom, and the run-unique metric names
-// exclude other runs. Returns ok=true at once for a client whose language is
-// unknown (it does not emit the metric, so there is nothing to assert). FAILS
-// CLOSED: if every query errors over the whole window (api down / wrong address),
-// ok=false — a down stack can never pass for "no loss" (see pollAbsenceTripwire).
+// assertNoClientWriteErr is the silent-loss tripwire: after a driver exits it
+// polls __src_client_write_err for the client's language and fails on any
+// non-zero point. The metric is realtime, so the window starts at the client
+// phase (statusAnchor), not the historic base; 200s covers build, run and the
+// conveyor with clock-skew headroom.
 func assertNoClientWriteErr(ctx context.Context, rec *recorder, apiAddr, clientTag string, statusAnchor uint32) (ok bool, detail string) {
 	lang, knows := clientWriteErrLang[clientTag]
 	if !knows {
-		return true, "" // this client's library does not emit the metric; nothing to assert
+		return true, ""
 	}
 	q := url.Values{}
 	q.Set("s", clientWriteErrMetric)
@@ -769,15 +636,12 @@ func assertNoClientWriteErr(ctx context.Context, rec *recorder, apiAddr, clientT
 	q.Set("w", "1s")
 	q.Set("ac", "1")
 	q.Set("qw", "sum")
-	q.Set("qb", "1") // group by the language tag → one series per client language
+	q.Set("qb", "1") // one series per client language
 	qurl := "http://" + apiAddr + "/api/query?" + q.Encode()
 
-	// A clean query (no error) confirms absence for this window iteration even when
-	// the language's series is absent (clientWriteErrForLang returns found=false → 0).
-	// pollAbsenceTripwire fails CLOSED: if every query errors for the whole window it
-	// returns ok=false, so a down/misconfigured api can never masquerade as "no loss".
+	// An absent language series reads as 0, which is a clean observation.
 	var (
-		violBody   string // raw reply of the first query that surfaced a non-zero point
+		violBody   string // raw reply of the first violating query
 		violStatus int
 	)
 	query := func(ctx context.Context) (float64, error) {
@@ -786,7 +650,7 @@ func assertNoClientWriteErr(ctx context.Context, rec *recorder, apiAddr, clientT
 			return 0, qerr
 		}
 		maxLost, _ := clientWriteErrForLang(resp, lang)
-		if maxLost > 0 && violBody == "" { // capture the violating payload once
+		if maxLost > 0 && violBody == "" {
 			violBody, violStatus = body, status
 		}
 		return maxLost, nil
@@ -796,8 +660,7 @@ func assertNoClientWriteErr(ctx context.Context, rec *recorder, apiAddr, clientT
 		return true, ""
 	}
 	if !o.confirmed {
-		// recordFailedQuery is nil-safe (a nil recorder is a no-op), so the other
-		// tripwire/assertion paths call it without a rec != nil guard too.
+		// recordFailedQuery is nil-safe.
 		rec.recordFailedQuery(failedQuery{
 			Label: "write_err", Client: clientTag, Metric: clientWriteErrMetric,
 			URL: qurl, HTTPStatus: 0, Body: "",
@@ -805,7 +668,7 @@ func assertNoClientWriteErr(ctx context.Context, rec *recorder, apiAddr, clientT
 		return false, fmt.Sprintf("client=%s lang=%s could not confirm absence of %s — every query failed over %s: %v\nurl: %s",
 			clientTag, lang, clientWriteErrMetric, writeErrTimeout, o.queryErr, qurl)
 	}
-	// A non-zero point surfaced → a dropped-bytes loss was recorded.
+	// A non-zero point surfaced: the client dropped bytes.
 	rec.recordFailedQuery(failedQuery{
 		Label: "write_err", Client: clientTag, Metric: clientWriteErrMetric,
 		URL: qurl, HTTPStatus: violStatus, Body: violBody,
@@ -814,12 +677,8 @@ func assertNoClientWriteErr(ctx context.Context, rec *recorder, apiAddr, clientT
 		clientTag, lang, o.worst, qurl)
 }
 
-// clientWriteErrForLang scans a __src_client_write_err reply (grouped by the
-// language tag, qb=1) for the given client's language and returns found=true with
-// the largest per-bucket lost-byte value if that language has any non-zero
-// bucket. With qb=1 the only grouped tag is the language (at index 1), so a value
-// match unambiguously identifies the language; the sentinel " 0"/empty drop never
-// equals "1"/"3"/"5".
+// clientWriteErrForLang returns the largest lost-byte value of the given
+// language's series in a __src_client_write_err reply grouped by language.
 func clientWriteErrForLang(resp *apiSeriesResponse, lang string) (maxLost float64, found bool) {
 	for i, meta := range resp.Data.Series.SeriesMeta {
 		if !seriesMetaHasLang(meta.Tags, lang) {
@@ -838,9 +697,7 @@ func clientWriteErrForLang(resp *apiSeriesResponse, lang string) (maxLost float6
 }
 
 // seriesMetaHasLang reports whether any tag in a series_meta carries the given
-// language code as its value. qb=1 leaves the language as the single grouped tag,
-// so this matches the one distinguishing value regardless of the key name the API
-// renders it under (key1 for a positional index).
+// language code; with qb=1 the language is the only grouped tag.
 func seriesMetaHasLang(tags map[string]apiMetaTag, lang string) bool {
 	for _, t := range tags {
 		if strings.TrimSpace(t.Value) == lang {
@@ -850,84 +707,32 @@ func seriesMetaHasLang(tags map[string]apiMetaTag, lang string) bool {
 	return false
 }
 
-// --- rejection statuses, conservation ledger, sampling tripwire ------
-//
-// The rejected inputs have NO visible output, so they are asserted three ways
-// against __src_ingestion_status (builtin -11, MetricKindCounter), the per-event
-// accounting counter the agent writes once per received event:
-//
-//   tag0=env, tag1=metric(NAME the event was mapped to), tag2=status(numeric VALUE
-//   ID — 10/ok_cached, 23/err_nan_inf_value, …; the human name lives only in the
-//   builtin's ValueComments and is NOT in the query reply), tag3=tag_id, tag4=
-//   component (1=agent, 2=agg).
-//
-// Each event is accounted EXACTLY ONCE in this metric:
-//   - accepted → ok_cached (the agent compacts many into an Ok2 item, the agg
-//     re-expands Ok2 back to ok_cached on insert; either way the count survives);
-//   - rejected → the matching err_* status (one increment per event).
-// The metric-not-found status (21) is the key exception. ApplyMetric's FIRST branch
-// (agent.go:805, h.MetricMeta == nil) routes an UNMAPPED name — a metric not yet
-// auto-created — to the sibling builtin __src_ingestion_status_no_shard (-148) with
-// the metric's tag ID 0, NOT to -11 (it carries h.IngestionStatus, typically
-// metric_not_found=21). So the cold-start SEEDS (unmapped on first contact) never
-// touch a real metric's -11 ledger. The mapped-err branch (agent.go:827,
-// h.IngestionStatus != 0) is a DIFFERENT path: it handles MAPPED metrics whose VALUE
-// failed validation (a real rejection), routing the err_* to -11 — it is NOT the seed
-// path (seeds are unmapped and caught at :805). The harness also excludes seeds from
-// stream.Writes, so both sides of the ledger see only the real (mapped) writes and
-// balance exactly. EXCEPTION: a PRE-CREATED metric (value_p, POST /api/metric) is
-// already mapped when its seed arrives, so the seed skips :805 and lands as +1
-// ok_cached in -11 — an over-count, which is why value_p is out of the ledger
-// (see ledgerEligibleKind).
+// Rejection statuses, conservation ledger and sampling tripwire. The agent
+// accounts every received event exactly once in __src_ingestion_status: ok_cached
+// when accepted, one err_* when rejected. An event for a not-yet-created metric
+// goes to __src_ingestion_status_no_shard instead, so unmapped cold-start seeds
+// never touch a metric's ledger.
 
-// ingestionStatusTail widens the realtime ledger/status query window. The caller
-// passes statusAnchor (client-phase start, ≈ wall-clock now); the window is
-// [statusAnchor, statusAnchor+ingestionStatusTail]. __src_ingestion_status is a
-// REALTIME builtin: the agent accounts each event at RECEIVE time (≈ the driver's
-// wall-clock write, statusAnchor..statusAnchor+(build+run duration)), NOT at the
-// event's historic ts. The historic conveyor then adds ~24s before a point is
-// queryable. On a normal run statusAnchor≈base+120 so the OLD base-derived window
-// happened to cover the events — but a --skip-client-build REPLAY keeps the
-// descriptor's OLD base while the agent records THIS run's events at replay-now, so
-// the window must anchor at statusAnchor, not base (F1). The tail gives the conveyor
-// + clock-skew headroom; metric names are run-unique, so the wide window cannot pick
-// up another run's statuses.
+// ingestionStatusTail is the length in seconds of the realtime status window
+// starting at statusAnchor. Statuses are recorded at receive time, not at the
+// event's historic ts; the tail covers build, run, the conveyor and clock skew.
+// Metric names are run-unique, so a wide window picks up no other run.
 const ingestionStatusTail = 400
 
-// ingestionStatusNumSeries is the `n` (num-results / series cap) passed on the
-// __src_ingestion_status query. The API DEFAULTS n to a small value (the live
-// stack returned a hard 10 series with no n — so a 14-metric client silently
-// dropped 4 metrics' statuses, every one of them then reading 0 and failing the
-// ledger as "silent loss"). One (metric,status) series per metric×status is
-// all we need (~14 metrics × a few statuses ≈ tens), well under the maxSeries
-// (10_000) ceiling, so a generous fixed cap is both safe and cap-proof.
+// ingestionStatusNumSeries is the series cap passed as n on the status query.
+// The API default of 10 silently drops metrics' statuses.
 const ingestionStatusNumSeries = 1000
 
-// ledgerTimeout bounds the ledger/status convergence poll. The conveyor lands the
-// status counters ~24s after the writes; assertStream (which runs first, polling up
-// to 60s per metric) has already waited well past that, so statuses are usually
-// landed by the time these run — 90s is conservative headroom.
+// ledgerTimeout bounds the ledger/status poll; assertStream runs first, so the
+// statuses have usually landed already.
 const ledgerTimeout = 90 * time.Second
 
-// samplingTimeout bounds the whole-run __agg_sampling_factor absence poll. It runs
-// after assertStream, whose per-query sampling check would have already failed had
-// any view been sampled, so by here any sampling point has long since landed. A
-// clean query showing zero is trustworthy; a non-zero point fails the moment it
-// appears (poll returns nil on done=true) rather than waiting the full window.
+// samplingTimeout bounds the whole-run __agg_sampling_factor absence poll. It
+// runs after assertStream, so any sampling point has long since landed.
 const samplingTimeout = 30 * time.Second
 
-// ingestionStatusURL builds GET /api/query for __src_ingestion_status grouped by
-// metric (qb=1, tag1) and status (qb=2, tag2), qw=count (the counter's per-event
-// increment summed per bucket). qw=count returns Σ counter value = total events
-// for that (metric, status) over the window — 1 per accepted event into ok_cached,
-// 1 per rejected event into its err_*.
-//
-// anchor is the REALTIME window start: __src_ingestion_status is recorded by the
-// agent at RECEIVE time (≈ the driver's wall-clock write), NOT at the event's
-// historic ts, so the window is [anchor, anchor+ingestionStatusTail]. The caller
-// passes statusAnchor (client-phase start) so a --skip-client-build replay — which
-// keeps the descriptor's OLD historic base while the agent records THIS run's
-// events at replay-now — still queries the right window (F1).
+// ingestionStatusURL builds the __src_ingestion_status event-count query grouped
+// by metric (tag1) and status (tag2) over [anchor, anchor+ingestionStatusTail].
 func ingestionStatusURL(apiAddr string, anchor uint32) string {
 	q := url.Values{}
 	q.Set("s", ingestionStatusMetric)
@@ -936,23 +741,15 @@ func ingestionStatusURL(apiAddr string, anchor uint32) string {
 	q.Set("w", "1s")
 	q.Set("ac", "1")
 	q.Set("qw", "count")
-	q.Set("n", strconv.Itoa(ingestionStatusNumSeries)) // raise the default series cap (10) so no metric is dropped
-	q.Add("qb", "1")                                   // metric name (tag1)
-	q.Add("qb", "2")                                   // status value ID (tag2)
+	q.Set("n", strconv.Itoa(ingestionStatusNumSeries))
+	q.Add("qb", "1") // metric name
+	q.Add("qb", "2") // status value ID
 	return "http://" + apiAddr + "/api/query?" + q.Encode()
 }
 
-// fetchIngestionBreakdown queries __src_ingestion_status and folds it into
-// map[metric][statusID]totalEvents over the run window, keeping only the metrics this
-// client generated (known). classifyIngestionSeries identifies the metric (key1, the
-// metric NAME, pinned to `known`) and the status (key2, a numeric VALUE ID) of each
-// series; both are read by their rendered key (confirmed against the live API).
-//
-// anchor is the REALTIME window start (see ingestionStatusURL). The verbatim
-// response body of the LAST successful query is also returned so a ledger/rejection
-// failure can record the raw JSON in the artifacts (F4). metricLedgerLine (the
-// diagnostic inline line) ignores the body and passes anchor=base+numBuckets to
-// preserve its historic-relative window.
+// fetchIngestionBreakdown folds __src_ingestion_status into
+// map[metric][statusID]events for the known metrics, and also returns the raw
+// response body for the failure artifacts.
 func fetchIngestionBreakdown(ctx context.Context, apiAddr string, anchor uint32, known map[string]bool) (map[string]map[int32]float64, string, error) {
 	resp, body, _, err := queryCounterRaw(ctx, ingestionStatusURL(apiAddr, anchor))
 	if err != nil {
@@ -962,7 +759,7 @@ func fetchIngestionBreakdown(ctx context.Context, apiAddr string, anchor uint32,
 	for i, meta := range resp.Data.Series.SeriesMeta {
 		metric, statusID := classifyIngestionSeries(meta.Tags, known)
 		if metric == "" || statusID == 0 {
-			continue // another metric (not in known), or a series the API could not label
+			continue
 		}
 		sum := seriesSum(resp.Data.Series.SeriesData[i])
 		if sum == 0 {
@@ -976,8 +773,7 @@ func fetchIngestionBreakdown(ctx context.Context, apiAddr string, anchor uint32,
 	return out, body, nil
 }
 
-// seriesSum sums every bucket value in one series' data array. The query window
-// already restricts the buckets, so this is the total event count for that series.
+// seriesSum sums every bucket value in one series' data array.
 func seriesSum(data []float64) float64 {
 	var s float64
 	for _, v := range data {
@@ -986,16 +782,9 @@ func seriesSum(data []float64) float64 {
 	return s
 }
 
-// classifyIngestionSeries identifies the metric and status of a __src_ingestion_status
-// series from its series_meta tags. The API renders the status tag (key2) as the
-// numeric status VALUE ID (e.g. " 10" for ok_cached, " 23" for err_nan_inf_value) —
-// NOT the human-readable name (the name lives only in the builtin's ValueComments,
-// which the query API does not return). So the status is parsed as an int32 ID and
-// the ledger works in IDs throughout, matched against rejectionMetric.StatusID. The
-// metric (key1) is the metric NAME, pinned to this client's generated set (`known`)
-// so another run's metrics or the env tag are ignored. Both tags are read by their
-// rendered key (key1/key2, confirmed against the live API); value-type fallbacks
-// (known membership / integer parse) cover any future key-name drift.
+// classifyIngestionSeries reads a __src_ingestion_status series' metric name
+// (key1, restricted to known) and numeric status ID (key2; the API renders IDs,
+// not names). Value-based fallbacks cover a future key rename.
 func classifyIngestionSeries(tags map[string]apiMetaTag, known map[string]bool) (metric string, statusID int32) {
 	if t, ok := tags["key1"]; ok {
 		if v := strings.TrimSpace(t.Value); known[v] {
@@ -1026,15 +815,11 @@ func classifyIngestionSeries(tags map[string]apiMetaTag, known map[string]bool) 
 	return metric, statusID
 }
 
-// statusIDOKCached is the __src_ingestion_status value ID for an accepted event
-// (TagValueIDSrcIngestionStatusOKCached, internal/format/builtin_tags.go).
+// statusIDOKCached is the __src_ingestion_status value ID for an accepted event.
 const statusIDOKCached int32 = 10
 
-// ingestionStatusNames maps a __src_ingestion_status value ID to its display name
-// (mirroring the builtin's ValueComments in internal/format/builtin_metrics.go). The
-// ledger logic works purely in IDs; this map exists only so failure detail reads as a
-// name (err_zero_counter) instead of a bare number (62). isWarnStatus keys off the
-// "warn_" prefix, so it stays correct as long as the warn entries are listed here.
+// ingestionStatusNames maps status IDs to the builtin's display names, for
+// failure detail and for isWarnStatus.
 var ingestionStatusNames = map[int32]string{
 	10: "ok_cached",
 	21: "err_metric_not_found",
@@ -1065,8 +850,7 @@ var ingestionStatusNames = map[int32]string{
 	63: "err_map_tag_value_corrupted",
 }
 
-// ingestionStatusName returns the display name for a status ID, or "status_<id>" for
-// an ID not in the map (a forward-compat sentinel for an enum added upstream).
+// ingestionStatusName returns the display name for a status ID, or "status_<id>".
 func ingestionStatusName(id int32) string {
 	if n, ok := ingestionStatusNames[id]; ok {
 		return n
@@ -1074,29 +858,17 @@ func ingestionStatusName(id int32) string {
 	return fmt.Sprintf("status_%d", id)
 }
 
-// isWarnStatus reports whether a status ID is a WARNING (warn_*). A warning
-// accompanies an ACCEPTED event (the event is still ok_cached — e.g. a clamped
-// timestamp is accepted with a warn; agent.go writes warns AFTER the ok_cached
-// increment), so the ledger EXCLUDES warnings: counting one would double-count its
-// event.
-//
-// FORWARD-COMPAT CAVEAT: classification keys off the "warn_" prefix the
-// ingestionStatusNames map assigns. A NEW upstream warn_* status ID NOT yet in that
-// map renders as "status_<id>" (ingestionStatusName's sentinel), which LACKS the
-// "warn_" prefix → isWarnStatus returns false → it is misclassified as an err and
-// folded into the error sum → the ledger fails loudly (an over-count) on the next
-// run. If that happens, add the new ID→name to ingestionStatusNames — that is the
-// only fix needed.
+// isWarnStatus reports whether a status is a warning. A warning accompanies an
+// accepted (ok_cached) event, so the ledger excludes it. A new upstream warn_*
+// ID missing from ingestionStatusNames counts as an error and fails the ledger
+// loudly; add it to the map.
 func isWarnStatus(id int32) bool {
 	return strings.HasPrefix(ingestionStatusName(id), "warn_")
 }
 
-// ledgerBalance splits one metric's __src_ingestion_status counts (keyed by status ID)
-// into the accepted total (ok_cached, ID 10), the rejected total (Σ of every
-// non-ok, non-warn status — i.e. Σ err_*), and the per-status error and WARNING
-// breakdowns (the latter kept for diagnostic context in a failure). Warnings are
-// excluded from the balance on both sides (see isWarnStatus): a warn accompanies an
-// accepted event (still ok_cached), so counting it would double-count.
+// ledgerBalance splits one metric's status counts into the accepted total, the
+// error total, and per-status error and warning breakdowns; warnings stay out
+// of the balance.
 func ledgerBalance(byID map[int32]float64) (okCached, errSum float64, errs, warns map[int32]float64) {
 	errs = make(map[int32]float64)
 	warns = make(map[int32]float64)
@@ -1105,7 +877,7 @@ func ledgerBalance(byID map[int32]float64) (okCached, errSum float64, errs, warn
 		case id == statusIDOKCached:
 			okCached += count
 		case isWarnStatus(id):
-			warns[id] = count // excluded from the balance — neither an acceptance nor a loss
+			warns[id] = count
 		default:
 			errSum += count
 			errs[id] = count
@@ -1114,46 +886,17 @@ func ledgerBalance(byID map[int32]float64) (okCached, errSum float64, errs, warn
 	return okCached, errSum, errs, warns
 }
 
-// ledgerEligibleKind reports whether a metric kind is in the conservation ledger's
-// EXACT scope. ok_cached counts accepted wire ITEMS: ApplyMetric (agent.go:800) runs
-// once per TL item and records ok_cached +1 (agent.go:856, count=1), so ok_cached is
-// the item count, not the write-call count. A driver write call maps 1:1 to an item
-// only for single-payload kinds — counter/stag (one count), value/value_nan/value_inf
-// (a small value set) — and there the identity sentWrites==ok_cached+err holds exactly.
-//
-// kindUnique and kindValueP are excluded, for TWO DIFFERENT reasons:
-//
-//   - kindUnique (u_approx): one write carries 100k int64 ≈ 800KB, which exceeds the
-//     per-packet cap, so EVERY client splits it into multiple wire items (go: TCP
-//     maxPacketSize=65535 → ~8k values/packet; rust/cpp: split loops). The go client's
-//     UniquesHistoric reservoir (driver sets MaxBucketSize=1<<18) bounds the sampled
-//     VALUES but does NOT prevent the wire split, so ok_cached (item count) lands well
-//     above sentWrites (write-call count) and the identity breaks. (u_exact is small
-//     enough to be 1:1, but both unique metrics share this kind, so the kind is out.)
-//
-//   - kindValueP is NOT a split case — its payload is 1:1 on the wire (2000 floats =
-//     16KB < go's 65535 TCP cap). It is excluded because the harness PRE-CREATES it
-//     (POST /api/metric, metric_create.go) so its cold-start SEED arrives MAPPED → the
-//     agent accounts it as +1 ok_cached in -11 (agent.go:856). Seeds live in
-//     streamSeeds, NOT stream.Writes, so sentWrites misses that +1 → a permanent
-//     over-count. Every auto-creating metric's seed is UNMAPPED on first contact and
-//     lands in -148 instead (see the seed-exclusion note below), so only the
-//     pre-created value_p has this over-count.
-//
-// Both excluded kinds are still covered by their own value/percentile/unique
-// assertions + the per-query sampling check; v_mix (kindValue, 4 values/write) stays
-// in — 4 values fit one item, confirmed exact.
+// ledgerEligibleKind reports whether a kind is in the ledger's exact scope.
+// ok_cached counts wire items, not write calls, so the identity
+// sentWrites == ok_cached + errors holds only for 1:1 kinds. Unique is out
+// because a 100k-value write splits into many packets; value_p is out because
+// it is pre-created, so its seed arrives mapped and adds one ok_cached.
 func ledgerEligibleKind(kind string) bool {
 	return kind != kindUnique && kind != kindValueP
 }
 
-// ledgerWriteCounts returns sentWrites per ELIGIBLE metric — the number of real writes
-// the harness generated for each (normal + rejection) — from stream.Writes, skipping
-// the multi-value kinds ledgerEligibleKind excludes (their item count ≠ write count).
-// This is the true input cardinality the conservation ledger balances against. Seeds
-// are NOT in stream.Writes (they live in streamSeeds), so the cold-start metric-not-
-// found accounting (which lands in __src_ingestion_status_no_shard, not -11) is
-// excluded on both sides and the ledger balances exactly.
+// ledgerWriteCounts returns sentWrites per ledger-eligible metric from
+// stream.Writes; seeds are not in it, matching their absence from the ledger.
 func ledgerWriteCounts(stream metricStream) map[string]int {
 	counts := make(map[string]int)
 	for _, w := range stream.Writes {
@@ -1165,8 +908,7 @@ func ledgerWriteCounts(stream metricStream) map[string]int {
 	return counts
 }
 
-// knownMetricNames is the set of metric names a client generated (normal + rejection),
-// the `known` set classifyIngestionSeries uses to pin a series to its metric.
+// knownMetricNames is the set of metric names a client generated.
 func knownMetricNames(stream metricStream) map[string]bool {
 	out := make(map[string]bool, len(stream.Metrics)+len(stream.Rejections))
 	for _, m := range stream.Metrics {
@@ -1178,15 +920,9 @@ func knownMetricNames(stream metricStream) map[string]bool {
 	return out
 }
 
-// pollIngestionLedger polls the shared __src_ingestion_status breakdown (one query
-// per tick) until BOTH the rejection-status and conservation-ledger criteria
-// converge — or ledgerTimeout elapses — then returns the last clean breakdown and
-// its raw response body. assertRejections and assertConservationLedger consumed the
-// SAME breakdown via the SAME query, so a single shared poll replaces the two
-// serial polls they used to run: one ledgerTimeout budget instead of two (halving
-// worst-case wall-clock) and one converged snapshot serves both renderers. Each
-// render function recomputes its own derived view (rejection statuses / write
-// counts) from `last` — they are cheap, pure folds over the stream.
+// pollIngestionLedger polls the __src_ingestion_status breakdown until both
+// the rejection statuses and the ledger converge or ledgerTimeout elapses, and
+// returns the last clean breakdown and its raw body for both assertions.
 func pollIngestionLedger(ctx context.Context, apiAddr string, stream metricStream, statusAnchor uint32) (map[string]map[int32]float64, string) {
 	known := knownMetricNames(stream)
 	want := ledgerWriteCounts(stream)
@@ -1197,7 +933,7 @@ func pollIngestionLedger(ctx context.Context, apiAddr string, stream metricStrea
 	_ = poll(ctx, ledgerTimeout, 3*time.Second, func() (bool, error) {
 		bd, body, err := fetchIngestionBreakdown(ctx, apiAddr, statusAnchor, known)
 		if err != nil {
-			return false, nil // transient query error → keep polling (absence is only trustworthy once clean)
+			return false, nil
 		}
 		last, lastBody = bd, body
 		return rejectionsConverged(stream.Rejections, bd) && ledgerConverged(want, bd), nil
@@ -1205,20 +941,14 @@ func pollIngestionLedger(ctx context.Context, apiAddr string, stream metricStrea
 	return last, lastBody
 }
 
-// assertRejections is criterion 2: each rejected input must surface its
-// EXACT __src_ingestion_status status with count == sentWrites. It renders one
-// PASS/FAIL per rejection metric from the converged breakdown pollIngestionLedger
-// returned. A rejection with Sent==false is a documented client-side drop (go/rust
-// refuse a non-positive count before the wire): the input never entered the
-// pipeline, so there is no server status to assert and the case is a documented
-// SKIP — not a silent disappearance. Returns pass/fail counts (one per rejection
-// metric).
+// assertRejections checks that each rejected input surfaces its exact status
+// with count == sentWrites, one PASS/FAIL per rejection metric. Client-dropped
+// cases pass as SKIPs.
 func assertRejections(rec *recorder, apiAddr, clientTag string, stream metricStream, statusAnchor uint32, last map[string]map[int32]float64, lastBody string) (passed, failed int) {
 	if len(stream.Rejections) == 0 {
 		return 0, 0
 	}
-	// statusAnchor anchors the REALTIME __src_ingestion_status window (F1); qurl is
-	// reused for every failure's failed-query record + the detail builder's url line.
+	// Used in failure records and details.
 	qurl := ingestionStatusURL(apiAddr, statusAnchor)
 	for _, r := range stream.Rejections {
 		if !r.Sent {
@@ -1246,8 +976,8 @@ func assertRejections(rec *recorder, apiAddr, clientTag string, stream metricStr
 	return passed, failed
 }
 
-// rejectionsConverged reports whether every GENERATED rejection (Sent==true) has
-// reached its exact status count. Skipped (Sent==false) rejections are unconstrained.
+// rejectionsConverged reports whether every sent rejection has reached its
+// exact status count.
 func rejectionsConverged(rejections []rejectionMetric, bd map[string]map[int32]float64) bool {
 	for _, r := range rejections {
 		if !r.Sent {
@@ -1268,28 +998,19 @@ func statusCount(breakdown map[int32]float64, statusID int32) float64 {
 	return breakdown[statusID]
 }
 
-// assertConservationLedger is criterion 3 + 5: the conservation invariant
-// per test metric M, EXACT:
+// assertConservationLedger checks, for every eligible metric M, the exact
+// invariant
 //
 //	sentWrites(M) == okCached(M) + Σ err_*(M)
 //
-// for EVERY metric the client generated (normal + rejection). It renders the
-// balance from the converged breakdown pollIngestionLedger returned. sentWrites is
-// the harness's true input cardinality; okCached is Σ
-// __src_ingestion_status{M,ok_cached}; err_* is the sum of all rejection statuses.
-// Warnings are excluded (they accompany accepted events). Under the no-sampling
-// config (assertNoAggSampling) the equation is exact; any drift is a real
-// conservation violation — silent loss (okCached+err < sentWrites) or
-// double-counting (>). On failure it prints the FULL breakdown (sentWrites,
-// okCached, every err_* status with its count) so the imbalance is diagnosed at a
-// glance. Returns pass/fail counts (one per metric).
+// Without sampling any drift is a real violation: silent loss (<) or
+// double-counting (>). Failures print the full status breakdown.
 func assertConservationLedger(rec *recorder, apiAddr, clientTag string, stream metricStream, statusAnchor uint32, last map[string]map[int32]float64, lastBody string) (passed, failed int) {
 	want := ledgerWriteCounts(stream)
-	excluded := ledgerExcludedMetricNames(stream) // multi-value metrics outside the exact 1:1 scope (see ledgerEligibleKind)
-	// statusAnchor anchors the REALTIME __src_ingestion_status window (F1); qurl is
-	// reused for every failure's failed-query record + the detail builder's url line.
+	excluded := ledgerExcludedMetricNames(stream)
+	// Used in failure records and details.
 	qurl := ingestionStatusURL(apiAddr, statusAnchor)
-	// Sorted iteration for stable, readable output.
+	// Sorted iteration for stable output.
 	names := make([]string, 0, len(want))
 	for n := range want {
 		names = append(names, n)
@@ -1326,9 +1047,8 @@ func assertConservationLedger(rec *recorder, apiAddr, clientTag string, stream m
 	return passed, failed
 }
 
-// ledgerExcludedMetricNames returns the distinct metric names whose kind is outside
-// the ledger's exact scope (ledgerEligibleKind), so the summary can state explicitly
-// which metrics are not balance-checked and why (avoids a silent "14 → 11" gap).
+// ledgerExcludedMetricNames returns the metrics outside the ledger's scope, so
+// the summary names them.
 func ledgerExcludedMetricNames(stream metricStream) []string {
 	seen := make(map[string]bool)
 	var out []string
@@ -1347,8 +1067,7 @@ func ledgerExcludedMetricNames(stream metricStream) []string {
 	return out
 }
 
-// ledgerConverged reports whether every metric balances yet (used to stop polling
-// early once the whole ledger has landed).
+// ledgerConverged reports whether every metric balances yet.
 func ledgerConverged(want map[string]int, bd map[string]map[int32]float64) bool {
 	for name, sentWrites := range want {
 		okCached, errSum, _, _ := ledgerBalance(bd[name])
@@ -1359,24 +1078,15 @@ func ledgerConverged(want map[string]int, bd map[string]map[int32]float64) bool 
 	return true
 }
 
-// aggSamplingFactorMetric is the builtin the agg increments when an insert is
-// SAMPLED (sampling factor >1). The harness's --min-insert-budget=100000000 /
-// --receive-budget-warming=0 / --disable-receive-sample-budget config keeps every
-// insert unsampled (sf=1), so this metric must stay ABSENT/zero across the whole run.
+// aggSamplingFactorMetric is the builtin the agg writes when it samples an
+// insert. The harness's budget flags keep every insert unsampled, so it must
+// stay zero for the whole run.
 const aggSamplingFactorMetric = "__agg_sampling_factor"
 
-// assertNoAggSampling is criterion 4, the whole-run sampling tripwire:
-// __agg_sampling_factor must stay absent/zero. A non-zero point means an insert was
-// sampled, which would break the ledger's exactness (err statuses ride the metric's
-// own sample budget) and the value assertions' representativeness. compareByFunc's
-// per-query sampling check already guards each queried VIEW; this is the historical,
-// whole-run confirmation over __agg_sampling_factor itself. ok=true means no sampling
-// point appeared within samplingTimeout (absent), confirmed by at least one CLEAN
-// query. Polls until a non-zero point shows (fails fast) or the window elapses clean.
-// The window is [statusAnchor, statusAnchor+ingestionStatusTail] — a REALTIME builtin
-// anchored at client-phase start, NOT the historic base (F1). FAILS CLOSED: if every
-// query errors over the whole window (api down / wrong address), ok=false — an
-// unobservable stack can never pass for "no sampling" (see pollAbsenceTripwire).
+// assertNoAggSampling is the whole-run sampling tripwire: __agg_sampling_factor
+// must stay zero, since sampling breaks the ledger's exactness. compareByFunc
+// checks each queried view; this covers the whole run over the realtime window
+// starting at statusAnchor, and fails closed like every absence poll.
 func assertNoAggSampling(ctx context.Context, rec *recorder, apiAddr, clientTag string, statusAnchor uint32) (ok bool, detail string) {
 	q := url.Values{}
 	q.Set("s", aggSamplingFactorMetric)
@@ -1387,11 +1097,9 @@ func assertNoAggSampling(ctx context.Context, rec *recorder, apiAddr, clientTag 
 	q.Set("qw", "count")
 	qurl := "http://" + apiAddr + "/api/query?" + q.Encode()
 
-	// pollAbsenceTripwire fails CLOSED: if every query errors for the whole window
-	// (api down / wrong address / schema drift) it returns ok=false, so a sampling
-	// event is never hidden behind a stack that could not be queried.
+	// pollAbsenceTripwire fails closed if every query errors.
 	var (
-		violBody   string // raw reply of the first query that surfaced a non-zero point
+		violBody   string // raw reply of the first violating query
 		violStatus int
 	)
 	query := func(ctx context.Context) (float64, error) {
@@ -1400,14 +1108,14 @@ func assertNoAggSampling(ctx context.Context, rec *recorder, apiAddr, clientTag 
 			return 0, qerr
 		}
 		mx := maxSeriesValue(resp)
-		if mx > 0 && violBody == "" { // capture the violating payload once
+		if mx > 0 && violBody == "" {
 			violBody, violStatus = body, status
 		}
 		return mx, nil
 	}
 	o := pollAbsenceTripwire(ctx, samplingTimeout, 3*time.Second, query)
 	if o.ok {
-		// No non-zero point appeared within samplingTimeout → no insert was sampled.
+		// No insert was sampled.
 		return true, ""
 	}
 	if !o.confirmed {
@@ -1418,7 +1126,7 @@ func assertNoAggSampling(ctx context.Context, rec *recorder, apiAddr, clientTag 
 		return false, fmt.Sprintf("client=%s could not confirm absence of %s — every query failed over %s: %v\nurl: %s",
 			clientTag, aggSamplingFactorMetric, samplingTimeout, o.queryErr, qurl)
 	}
-	// A non-zero point surfaced → an insert was sampled during the run.
+	// An insert was sampled during the run.
 	rec.recordFailedQuery(failedQuery{
 		Label: "sampling", Client: clientTag, Metric: aggSamplingFactorMetric,
 		URL: qurl, HTTPStatus: violStatus, Body: violBody,
@@ -1427,8 +1135,7 @@ func assertNoAggSampling(ctx context.Context, rec *recorder, apiAddr, clientTag 
 		clientTag, aggSamplingFactorMetric, o.worst, qurl)
 }
 
-// maxSeriesValue is the largest value across every series and bucket in a reply
-// (0 for an empty/absent metric). Used to detect any non-zero __agg_sampling_factor.
+// maxSeriesValue is the largest value across every series and bucket in a reply.
 func maxSeriesValue(resp *apiSeriesResponse) float64 {
 	var mx float64
 	for _, data := range resp.Data.Series.SeriesData {
@@ -1441,9 +1148,7 @@ func maxSeriesValue(resp *apiSeriesResponse) float64 {
 	return mx
 }
 
-// sortedStatusIDs returns the status IDs of a per-status breakdown in ascending
-// order, so the failure-detail renderers emit their status rows in a stable order
-// (independent of map iteration order).
+// sortedStatusIDs returns a breakdown's status IDs in ascending order.
 func sortedStatusIDs(m map[int32]float64) []int32 {
 	ids := make([]int32, 0, len(m))
 	for id := range m {
@@ -1453,12 +1158,8 @@ func sortedStatusIDs(m map[int32]float64) []int32 {
 	return ids
 }
 
-// ledgerFailDetail renders the full conservation breakdown for one imbalanced
-// metric: the equation that failed, then every status→count the pipeline recorded
-// for it (status name + ID) — including warn_* rows (marked as warnings, not losses)
-// for diagnostic context — so a loss vs a double-count vs an unexpected status is
-// visible at once. qurl (the __src_ingestion_status query) is appended so the
-// failing query is pinpointed alongside the breakdown (F4).
+// ledgerFailDetail renders the failed equation and the full status breakdown,
+// warnings included, for one imbalanced metric.
 func ledgerFailDetail(name string, sentWrites int, okCached, errSum float64, errs, warns map[int32]float64, qurl string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "conservation imbalance: ok_cached(%g) + Σerr(%g) = %g ≠ sentWrites=%d\n",
@@ -1477,8 +1178,7 @@ func ledgerFailDetail(name string, sentWrites int, okCached, errSum float64, err
 	for _, id := range ids {
 		fmt.Fprintf(&b, "    %s(%d)=%g\n", ingestionStatusName(id), id, errs[id])
 	}
-	// Warnings accompany ACCEPTED events (excluded from the balance); shown here only
-	// for diagnostic context (e.g. a clamped timestamp) — they are NOT losses.
+	// Warnings accompany accepted events; shown for context only.
 	for _, id := range sortedStatusIDs(warns) {
 		fmt.Fprintf(&b, "    %s(%d)=%g (warning — accepted, not a loss)\n", ingestionStatusName(id), id, warns[id])
 	}
@@ -1486,11 +1186,8 @@ func ledgerFailDetail(name string, sentWrites int, okCached, errSum float64, err
 	return b.String()
 }
 
-// rejectionFailDetail renders the status breakdown for one rejection that did not
-// produce its exact status count: what was expected vs got, then every status the
-// pipeline recorded for that metric (status name + ID), so a wrong status or a
-// partial rejection is visible. qurl (the __src_ingestion_status query) is appended
-// so the failing query is pinpointed alongside the breakdown (F4).
+// rejectionFailDetail renders expected vs got and the full status breakdown for
+// one rejection that missed its exact count.
 func rejectionFailDetail(r rejectionMetric, breakdown map[int32]float64, qurl string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "expected %s(%d) count=%d, got count=%g\n",

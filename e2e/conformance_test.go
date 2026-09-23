@@ -19,15 +19,12 @@ import (
 	statshouse "github.com/VKCOM/statshouse-go"
 )
 
-// confStream builds one generated stream the way runConformancePhase does
-// (deterministic run id + fixed "now" so every request path is stable).
+// confStream builds the stream runConformancePhase does, with a fixed run id and now.
 func confStream(t *testing.T) metricStream {
 	t.Helper()
 	return generateStream("20260815-000000", conformanceClientTag, time.Unix(1800000000, 0))
 }
 
-// metricByName finds a stream metric by name suffix (same lookup rule the
-// request builder uses).
 func metricByName(t *testing.T, s metricStream, suffix string) metricModel {
 	t.Helper()
 	m, ok := confMetric(s, suffix)
@@ -35,10 +32,7 @@ func metricByName(t *testing.T, s metricStream, suffix string) metricModel {
 	return m
 }
 
-// The request set must cover every endpoint kind and the full per-kind
-// function matrix, be issued with the frozen asserter's param shape, and never
-// carry the same (kind, path) twice (a duplicate would silently double-count a
-// pass and mask a dropped sibling).
+// A duplicate (kind, path) would double-count a pass and mask a dropped sibling.
 func TestBuildConformanceRequestsCoverage(t *testing.T) {
 	stream := confStream(t)
 	reqs := buildConformanceRequests(stream)
@@ -59,7 +53,6 @@ func TestBuildConformanceRequestsCoverage(t *testing.T) {
 	require.Contains(t, kinds, confPoint)
 	require.Contains(t, kinds, confTagValues)
 
-	// every metric contributes its funcsFor function set
 	qwByMetric := map[string]map[string]bool{}
 	for _, r := range reqs {
 		if r.kind != confSeries || strings.HasPrefix(r.label, "series-mh/") || strings.HasPrefix(r.label, "series-host/") || strings.HasPrefix(r.label, "promql/") {
@@ -79,8 +72,7 @@ func TestBuildConformanceRequestsCoverage(t *testing.T) {
 		require.Equal(t, want, qwByMetric[confShortName(m.Name)], "metric %s function coverage", m.Name)
 	}
 
-	// every value_p metric carries its exact companions (count+sum) so a
-	// percentile divergence is diagnosable in-run as data- vs estimator-level
+	// value_p count+sum companions tell data- from estimator-level divergence
 	for _, m := range stream.Metrics {
 		if m.Kind != kindValueP {
 			continue
@@ -100,9 +92,7 @@ func TestBuildConformanceRequestsCoverage(t *testing.T) {
 	}
 }
 
-// Series requests must be param-identical to the frozen asserter's URLs — the
-// differential claims "same shape the verified suite queries" only if the
-// query string matches byte for byte (modulo the address).
+// Series query strings must match the frozen asserter's byte for byte.
 func TestConformanceSeriesParityWithAsserter(t *testing.T) {
 	stream := confStream(t)
 	reqs := buildConformanceRequests(stream)
@@ -125,8 +115,6 @@ func TestConformanceSeriesParityWithAsserter(t *testing.T) {
 	require.Positive(t, seen)
 }
 
-// The host, table, point, promql and tag-values requests hit their real
-// endpoints with the params their handlers read.
 func TestConformanceSpecialRequestShapes(t *testing.T) {
 	stream := confStream(t)
 	reqs := buildConformanceRequests(stream)
@@ -142,7 +130,6 @@ func TestConformanceSpecialRequestShapes(t *testing.T) {
 		return u.Query()
 	}
 
-	// host variants stay on /api/query with mh/qw
 	mh, ok := byLabel["series-mh/c_tagged/count"]
 	require.True(t, ok)
 	require.Equal(t, "/api/query", strings.SplitN(mh.path, "?", 2)[0])
@@ -152,14 +139,12 @@ func TestConformanceSpecialRequestShapes(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "max_count_host", q(host.path).Get("qw"))
 
-	// the month-LOD series overrides the default 1s step with w=1M
 	month, ok := byLabel["series-month/c_tagged/count"]
 	require.True(t, ok)
 	require.Equal(t, "/api/query", strings.SplitN(month.path, "?", 2)[0])
 	require.Equal(t, "1M", q(month.path).Get("w"))
 	require.Equal(t, "count", q(month.path).Get("qw"))
 
-	// table swaps only the endpoint path
 	tvs, ok := byLabel["table/v_mix/sum"]
 	require.True(t, ok)
 	require.Equal(t, "/api/table", strings.SplitN(tvs.path, "?", 2)[0])
@@ -177,8 +162,7 @@ func TestConformanceSpecialRequestShapes(t *testing.T) {
 	require.Equal(t, fmtUint(base+numBuckets-1), pq.Get("f"))
 	require.Equal(t, fmtUint(base+numBuckets), pq.Get("t"))
 
-	// promql carries the multi-metric regex with __what__/__by__; label names
-	// must be bare identifiers (the parser rejects quoted label names)
+	// label names must be bare identifiers (the parser rejects quoted ones)
 	prom, ok := byLabel["promql/c_multi|c_matrix/count-by-0"]
 	require.True(t, ok)
 	multi := metricByName(t, stream, "c_multi")
@@ -187,7 +171,6 @@ func TestConformanceSpecialRequestShapes(t *testing.T) {
 	require.Contains(t, q(prom.path).Get("q"), `__what__="count"`)
 	require.Contains(t, q(prom.path).Get("q"), `__by__="0"`)
 
-	// tag-values names the metric, the tag id, the range and the cap
 	for _, suffix := range []string{"c_matrix", "u_exact"} {
 		tv, ok := byLabel["tag-values/"+suffix+"/k0"]
 		require.True(t, ok, suffix)
@@ -211,14 +194,11 @@ func jsonUint(v uint32) string {
 	return string(b)
 }
 
-// The tolerance table mirrors the frozen suite semantics exactly: exact for
-// count-like kinds, banded for percentiles, threshold-split for uniques.
+// Mirrors the frozen suite: exact for counts, banded percentiles, threshold-split uniques.
 func TestConfValueMatches(t *testing.T) {
 	require.True(t, confValueMatches("count", 41, 41))
 	require.False(t, confValueMatches("count", 41, 41.5))
-	// sum/avg: the cross-store float-accumulation-order band — last-ulp noise
-	// passes (observed live: 644601.744 vs 644601.7439999995), any real
-	// divergence fails
+	// sum/avg tolerate float-accumulation-order noise, not real divergence
 	require.True(t, confValueMatches("sum", 644601.744, 644601.7439999995))
 	require.True(t, confValueMatches("avg", 1e9, 1e9+0.001))
 	require.False(t, confValueMatches("sum", 1e9, 1e9+1e5))
@@ -243,9 +223,7 @@ func TestConfValueMatches(t *testing.T) {
 	require.False(t, confValueMatches("unique", float64(uniquesHashMaxSize+1), float64(uniquesHashMaxSize+1)*1.021))
 }
 
-// Series comparison: values under tolerance, sampling factors zero, time axes
-// and series sets exact, max_hosts exact, "__name__" kept in the signature so
-// multi-metric series never alias.
+// "__name__" stays in the series signature so multi-metric series never alias.
 func TestCompareConfSeries(t *testing.T) {
 	meta := func(tags map[string]string, hosts ...string) confSeriesMeta {
 		m := confSeriesMeta{Tags: map[string]apiMetaTag{}, MaxHosts: hosts}
@@ -301,7 +279,7 @@ func TestCompareConfSeries(t *testing.T) {
 		ref := build(0, meta(map[string]string{"__name__": "m1"}), meta(map[string]string{"__name__": "m2"}))
 		got := build(0, meta(map[string]string{"__name__": "m1"}), meta(map[string]string{"__name__": "m2"}))
 		require.Empty(t, compareConfSeries(ref, got, "count"))
-		// swapping the two metrics' data IS a divergence
+		// swapping the two metrics' data is a divergence
 		got.Data.Series.SeriesData[0], got.Data.Series.SeriesData[1] = []float64{9, 9, 9}, []float64{1, 2, 3}
 		require.NotEmpty(t, compareConfSeries(ref, got, "count"))
 	})
@@ -330,8 +308,6 @@ func TestCompareConfSeries(t *testing.T) {
 	})
 }
 
-// Table comparison is order-insensitive on rows, exact on cells, and checks
-// the What columns and the truncation flag.
 func TestCompareConfTable(t *testing.T) {
 	row := func(ts int64, sig string, vals ...float64) (struct {
 		Time int64                 `json:"time"`
@@ -388,12 +364,11 @@ func TestCompareConfTable(t *testing.T) {
 		require.Contains(t, diffs[0], "more=")
 	})
 	t.Run("sum cells use the float-ordering band", func(t *testing.T) {
-		// the live differential observed ~1e-16 relative drift on large sums —
-		// float64 addition order, not a semantic divergence
+		// ~1e-16 relative drift on large sums is float addition order
 		a, _ := row(100, "a", 644601.744)
 		b, _ := row(100, "a", 644601.7439999995)
 		require.Empty(t, compareConfTable(build(false, a), build(false, b), "sum"))
-		// a real divergence (0.01%) stays far above the 1e-9 band
+		// a real 0.01% divergence stays far above the band
 		big, _ := row(101, "b", 1e6)
 		wrong, _ := row(101, "b", 1.0001e6)
 		require.NotEmpty(t, compareConfTable(build(false, big), build(false, wrong), "sum"))
@@ -404,9 +379,7 @@ func TestCompareConfTable(t *testing.T) {
 	})
 }
 
-// Point comparison keys points by tags+host+range, so a shifted host or
-// window is a missing point, not a value compare; values use the tolerance
-// table.
+// Points are keyed by tags+host+range: a shifted host or window is a missing point.
 func TestCompareConfPoint(t *testing.T) {
 	build := func(host string, from, to int64, val float64) *confPointResp {
 		r := &confPointResp{}
@@ -425,10 +398,8 @@ func TestCompareConfPoint(t *testing.T) {
 	require.Len(t, diffs, 1)
 	require.Contains(t, diffs[0], "reference=7")
 
-	// p90 banded
 	require.Empty(t, compareConfPoint(build("h", 100, 101, 100), build("h", 100, 101, 101), "p90"))
 
-	// different host = a different point, not a value compare
 	diffs = compareConfPoint(build("h1", 100, 101, 7), build("h2", 100, 101, 7), "count")
 	require.Len(t, diffs, 2)
 	joined := strings.Join(diffs, "\n")
@@ -436,8 +407,6 @@ func TestCompareConfPoint(t *testing.T) {
 	require.Contains(t, joined, "absent in duck")
 }
 
-// Tag-values comparison is exact on the (value, count) pairs and the
-// truncation flag, order-insensitive.
 func TestCompareConfTagValues(t *testing.T) {
 	build := func(more bool, pairs ...[2]any) *confTagValuesResp {
 		r := &confTagValuesResp{}
@@ -467,8 +436,7 @@ func TestCompareConfTagValues(t *testing.T) {
 	require.Contains(t, diffs[0], "tag_values_more")
 }
 
-// confNonEmpty is the vacuous-pass guard: every kind must distinguish an
-// empty answer from a data-carrying one.
+// confNonEmpty guards against a vacuous pass on an empty answer.
 func TestConfNonEmpty(t *testing.T) {
 	series := &confSeriesResp{}
 	series.Data.Series = confSeriesData{Time: []int64{1}, SeriesMeta: []confSeriesMeta{{}}, SeriesData: [][]float64{{1}}}
@@ -503,10 +471,7 @@ func TestConfNonEmpty(t *testing.T) {
 	require.True(t, confNonEmpty(confTagValues, confDecoded{tags: tags}))
 }
 
-// The decoders must read the exact JSON field names the API emits (handler.go
-// marshals series_meta.tags as {value: string}, table from_row/to_row as
-// STRINGS, point_meta as {tags,max_host,from_sec,to_sec}, tag_values as
-// {value,count}).
+// The decoders must match the API's JSON field names (table from_row/to_row are strings).
 func TestConfDecodersReadAPIJSON(t *testing.T) {
 	t.Run("series", func(t *testing.T) {
 		body := `{"data":{"series":{"time":[100,101],"series_meta":[{"tags":{"key0":{"value":"a"}},"max_hosts":["h1"]}],"series_data":[[1,2]]},"sampling_factor_src":0,"sampling_factor_agg":0}}`
@@ -548,8 +513,7 @@ func TestConfDecodersReadAPIJSON(t *testing.T) {
 	})
 }
 
-// Two stacks on one network: names carry the tag between runID and role and
-// keep the e2e-prefix invariant the pruner/teardown match on.
+// Two stacks share a network; pruning and teardown match on the e2e prefix.
 func TestDaemonStackCnameStackTag(t *testing.T) {
 	o := daemonStackOpts{runID: "20260815-000000"}
 	require.Equal(t, "e2e-20260815-000000-agg", o.cname("agg"))
@@ -558,8 +522,7 @@ func TestDaemonStackCnameStackTag(t *testing.T) {
 	require.True(t, strings.HasPrefix(o.cname("api"), e2ePrefix+"20260815-000000-"))
 }
 
-// Log names must stay distinct across the two conformance stacks (ch-agg vs
-// duck-agg) and unchanged for the historical single-stack shape.
+// Log names must stay distinct across the two conformance stacks.
 func TestServiceLogNameRunIDAware(t *testing.T) {
 	const runID = "20260815-000000"
 	require.Equal(t, "ch-agg", serviceLogName("e2e-"+runID+"-ch-agg", runID))
@@ -576,20 +539,15 @@ func TestConfShortName(t *testing.T) {
 	require.Equal(t, "plain", confShortName("plain"))
 }
 
-// confNamedTags renders generated tags verbatim — including empty values and
-// the whitespace sentinel — exactly as the go driver template does.
+// Tags render verbatim, including empty values, as the go driver template does.
 func TestConfNamedTagsVerbatim(t *testing.T) {
 	got := confNamedTags([]tag{{Key: "0", Val: "a"}, {Key: "1", Val: ""}, {Key: "2", Val: "0"}})
 	require.Equal(t, statshouse.NamedTags{{"0", "a"}, {"1", ""}, {"2", "0"}}, got)
 }
 
-// TestStatshouseGoSingleAddrCloseQuirk pins the upstream statshouse-go
-// v0.5.17 behavior seedConformanceStream's close handling depends on: a
-// healthy single-address TCP client's Close() returns exactly
-// statshouseGoEmptyAddrErr (the idle secondary pool's structural error — the
-// primary's real close error is returned FIRST when non-nil). If the
-// dependency is ever upgraded and this starts returning nil, the quirk
-// workaround in seedConformanceStream is dead code and should be dropped.
+// Pins statshouse-go v0.5.17: a healthy single-address TCP client's Close() returns
+// statshouseGoEmptyAddrErr from the idle secondary pool. If an upgrade makes it nil,
+// drop the workaround in seedConformanceStream.
 func TestStatshouseGoSingleAddrCloseQuirk(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)

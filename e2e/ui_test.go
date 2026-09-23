@@ -6,8 +6,7 @@ import (
 	"testing"
 )
 
-// writeFiles writes {path: content} into dir, creating parent dirs as needed. Shared by
-// the temp-tree fixtures below.
+// writeFiles writes {path: content} into dir, creating parent dirs as needed.
 func writeFiles(t *testing.T, dir string, files map[string]string) {
 	t.Helper()
 	for path, content := range files {
@@ -21,10 +20,7 @@ func writeFiles(t *testing.T, dir string, files map[string]string) {
 	}
 }
 
-// writeUITree builds a minimal statshouse-ui-like tree in a temp dir (a fresh one per
-// call) so the fingerprint tests are hermetic and not coupled to the real checkout. It
-// spans nested dirs, a lockfile pair, and a config + sources so additions/deletes/renames
-// and lockfile edits all have something realistic to act on.
+// writeUITree builds a minimal statshouse-ui-like tree so fingerprint tests are hermetic.
 func writeUITree(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -39,11 +35,6 @@ func writeUITree(t *testing.T) string {
 	return dir
 }
 
-// TestUISourceFingerprint exercises the deterministic source-tree fingerprint: it is
-// stable across repeated scans of an unchanged tree, and it changes on a content edit,
-// a deletion, an addition, a rename, AND a content change that preserves the original
-// (older) mtime — the exact blind spot of an mtime-only rule. Files under the excluded
-// generated/installed dirs (node_modules, build, .git) must NOT affect it.
 func TestUISourceFingerprint(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -99,8 +90,7 @@ func TestUISourceFingerprint(t *testing.T) {
 			true,
 		},
 		{
-			// The decisive mtime-blind-spot case: bytes change but the file's mtime is
-			// restored to its pre-edit value, so an mtime-only rule would miss it.
+			// the blind spot of an mtime-only rule
 			"content change with preserved mtime changes fingerprint",
 			func(t *testing.T, dir string) {
 				f := filepath.Join(dir, "src/index.ts")
@@ -148,7 +138,7 @@ func TestUISourceFingerprint(t *testing.T) {
 			if fp1 == "" {
 				t.Fatal("empty fingerprint")
 			}
-			// Stability: an identical re-scan of the unchanged tree is byte-identical.
+
 			if fp1b, err := uiSourceFingerprint(dir); err != nil || fp1b != fp1 {
 				t.Fatalf("fingerprint not stable on unchanged tree: %q vs %q (%v)", fp1, fp1b, err)
 			}
@@ -167,8 +157,7 @@ func TestUISourceFingerprint(t *testing.T) {
 	}
 }
 
-// TestUISourceFingerprintEmptyTree confirms an empty tree errors (no source files) rather
-// than returning a silent zero hash, so a missing statshouse-ui checkout fails loudly.
+// A missing statshouse-ui checkout must fail loudly, not hash to a silent zero.
 func TestUISourceFingerprintEmptyTree(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := uiSourceFingerprint(dir); err == nil {
@@ -176,7 +165,6 @@ func TestUISourceFingerprintEmptyTree(t *testing.T) {
 	}
 }
 
-// TestUINeedsRebuild covers the pure rebuild rule under the content-fingerprint model.
 func TestUINeedsRebuild(t *testing.T) {
 	const fp = "abc123"
 	cases := []struct {
@@ -202,9 +190,7 @@ func TestUINeedsRebuild(t *testing.T) {
 	}
 }
 
-// TestUIIndexLooksBuilt confirms the served-root check accepts the built app's index.html
-// (which carries the React mount) and rejects the e2e/api-static placeholder and anything
-// without the mount point.
+// The built index.html carries the React mount; the e2e/api-static placeholder does not.
 func TestUIIndexLooksBuilt(t *testing.T) {
 	cases := map[string]struct {
 		body string
@@ -224,7 +210,6 @@ func TestUIIndexLooksBuilt(t *testing.T) {
 	}
 }
 
-// TestNpmCPU confirms GOARCH values map to npm's --cpu vocabulary (amd64→x64).
 func TestNpmCPU(t *testing.T) {
 	cases := map[string]string{
 		"arm64": "arm64",
@@ -239,8 +224,7 @@ func TestNpmCPU(t *testing.T) {
 	}
 }
 
-// writeLockfiles stages a minimal uiDir with just the two lockfiles for the npm-cache
-// fingerprint tests (temp fixture, not the real repo).
+// writeLockfiles stages a uiDir holding only the two lockfiles.
 func writeLockfiles(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -251,9 +235,7 @@ func writeLockfiles(t *testing.T) string {
 	return dir
 }
 
-// TestNpmCacheFingerprint proves the npm-cache fingerprint is deterministic for a given
-// (lockfiles, arch, libc, image) and changes when the node image or the arch changes — so
-// a node bump or arch switch re-populates the cache instead of serving a stale dep set.
+// A node bump or arch switch must re-populate the npm cache instead of serving stale deps.
 func TestNpmCacheFingerprint(t *testing.T) {
 	dir := writeLockfiles(t)
 	a, err := npmCacheFingerprintFor(dir, "arm64", uiLibc, "node:20.20.2-bookworm-slim@sha256:aaa")
@@ -263,23 +245,21 @@ func TestNpmCacheFingerprint(t *testing.T) {
 	if a == "" {
 		t.Fatal("empty fingerprint")
 	}
-	// Deterministic: same inputs → same hash.
+
 	if b, err := npmCacheFingerprintFor(dir, "arm64", uiLibc, "node:20.20.2-bookworm-slim@sha256:aaa"); err != nil || a != b {
 		t.Fatalf("npm-cache fingerprint not deterministic: %q vs %q (%v)", a, b, err)
 	}
-	// Different digest → different hash (the cache must re-populate on a node bump).
+
 	if b, err := npmCacheFingerprintFor(dir, "arm64", uiLibc, "node:20.20.2-bookworm-slim@sha256:bbb"); err != nil || a == b {
 		t.Fatalf("fingerprint must change when the node image digest changes: both %q", a)
 	}
-	// Different arch → different hash.
+
 	if c, err := npmCacheFingerprintFor(dir, "amd64", uiLibc, "node:20.20.2-bookworm-slim@sha256:aaa"); err != nil || a == c {
 		t.Fatalf("fingerprint must change when arch changes: both %q", a)
 	}
 }
 
-// TestBuildMarkerRoundTrip verifies the marker persists image + fingerprint across a
-// write/read, a missing file yields the zero marker (forces rebuild), and a legacy marker
-// (plain text, no JSON) also yields the zero marker rather than a parse failure.
+// Missing and legacy plain-text markers read as the zero marker, which forces a rebuild.
 func TestBuildMarkerRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, uiBuiltMarker)
@@ -291,11 +271,11 @@ func TestBuildMarkerRoundTrip(t *testing.T) {
 	if got.Image != want.Image || got.Fingerprint != want.Fingerprint {
 		t.Fatalf("round trip mismatch: wrote %+v, read %+v", want, got)
 	}
-	// A missing file → zero marker (forces rebuild via uiNeedsRebuild).
+
 	if m := readBuildMarker(filepath.Join(dir, "nope")); m != (uiBuildMarker{}) {
 		t.Fatalf("missing marker = %+v, want zero", m)
 	}
-	// A legacy ("ok\n") marker → zero marker, not a parse error.
+
 	legacy := filepath.Join(dir, "legacy")
 	if err := os.WriteFile(legacy, []byte("ok\n"), 0o644); err != nil {
 		t.Fatalf("write legacy marker: %v", err)

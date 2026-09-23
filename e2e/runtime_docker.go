@@ -6,19 +6,14 @@ import (
 	"fmt"
 )
 
-// dockerRuntime shells out to docker (the Linux path, also usable on macOS when
-// apple/container is absent). The daemon version is not pinned in v1.
+// dockerRuntime shells out to docker (default on Linux).
 type dockerRuntime struct{}
 
 func (r *dockerRuntime) Name() string { return "docker" }
 
-// HasNetworkEgress: docker containers have NAT egress, so the --with-ui build can
-// run npm online inside the node container (no host npm needed). See
-// Runtime.HasNetworkEgress.
 func (r *dockerRuntime) HasNetworkEgress() bool { return true }
 
 func (r *dockerRuntime) EnsureSystem(ctx context.Context) error {
-	// `docker info` fails fast if the daemon is down.
 	if _, err := runOK(ctx, "docker", "info"); err != nil {
 		return fmt.Errorf("docker daemon not reachable (`docker info` failed): %w", err)
 	}
@@ -26,7 +21,6 @@ func (r *dockerRuntime) EnsureSystem(ctx context.Context) error {
 }
 
 func (r *dockerRuntime) CheckVersion(_ context.Context) error {
-	// Not pinned in v1; the spec pins only apple/container (per-release drift).
 	return nil
 }
 
@@ -71,8 +65,7 @@ func (r *dockerRuntime) Run(ctx context.Context, opts RunOpts) error {
 func (r *dockerRuntime) Exec(ctx context.Context, id string, cmd []string) (string, int, error) {
 	args := append([]string{"exec", id}, cmd...)
 	res, err := run(ctx, "docker", args...)
-	// Combine stdout and stderr so clickhouse-client errors (written to stderr)
-	// appear in probe output and failure diagnostics.
+	// clickhouse-client writes errors to stderr; keep them in probe output.
 	return res.stdout + res.stderr, res.exitCode, err
 }
 
@@ -123,9 +116,7 @@ func (r *dockerRuntime) InspectIP(ctx context.Context, id, network string) (stri
 	}
 	nets := arr[0].NetworkSettings.Networks
 	if network != "" {
-		// A specific network was requested: if the container is not attached to
-		// it, that is a wiring error — do NOT fall back to some other network's
-		// IP (which would silently point inter-service wiring at the wrong place).
+		// Never fall back to another network's IP: that would silently miswire.
 		n, ok := nets[network]
 		if !ok {
 			return "", fmt.Errorf("container %q is not attached to network %q", id, network)

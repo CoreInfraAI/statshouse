@@ -1,12 +1,7 @@
 package main
 
-// The harness's storage-backend selection: the same suite drives either the
-// usual ClickHouse stack (the default) or the duck stack, where DuckDB lives
-// inside the aggregator, no ClickHouse container exists, and the api reads
-// through the aggregator's structured query RPC. Everything backend-specific
-// resolves through the helpers here so the boot code in main.go/daemons.go
-// stays a branch on one value, and the choice is unit-testable without any
-// container.
+// Backend-specific helpers: under duck, DuckDB lives inside the aggregator, no
+// ClickHouse container exists and the api reads through the aggregator's RPC.
 
 import (
 	"context"
@@ -23,9 +18,6 @@ import (
 	"github.com/VKCOM/statshouse/internal/duckstore"
 )
 
-// storageBackend names the metric-data backend a run drives: clickhouse (a
-// ClickHouse container plus the four daemons pointed at it) or duck (the
-// duckdb-tagged aggregator is the storage; no ClickHouse container).
 type storageBackend = duckstore.StorageBackend
 
 const (
@@ -33,12 +25,9 @@ const (
 	backendDuck       = duckstore.BackendDuck
 )
 
-// daemonSpecsFor returns the daemons to cross-compile for a backend. The two
-// backends differ in exactly one daemon: under duck the aggregator is built
-// from the same package with the `duckdb` build tag and the verified static
-// cgo link, and is cached under its own binary name so it never collides with
-// (or rebuilds over) the pure-Go aggregator of a clickhouse run sharing the
-// same cache dir.
+// daemonSpecsFor returns the daemons to cross-compile for a backend. Under duck
+// the aggregator is the duckdb-tagged static build, cached under its own name
+// so it never overwrites the pure-Go one in the shared cache dir.
 func daemonSpecsFor(backend storageBackend) []daemonSpec {
 	specs := make([]daemonSpec, len(daemonCmds))
 	copy(specs, daemonCmds)
@@ -57,10 +46,8 @@ func daemonSpecsFor(backend storageBackend) []daemonSpec {
 	return specs
 }
 
-// aggBinName is the cached binary name of the aggregator for a backend: the
-// pure-Go build under clickhouse, the DuckDB-tagged static build under duck.
-// The container mounts either one at /statshouse-agg, so the entrypoint script
-// never varies with the backend.
+// aggBinName is the aggregator's cached binary name; either is mounted at
+// /statshouse-agg, so the entrypoint never varies with the backend.
 func aggBinName(backend storageBackend) string {
 	if backend == backendDuck {
 		return "statshouse-agg-duck"
@@ -68,16 +55,12 @@ func aggBinName(backend storageBackend) string {
 	return "statshouse-agg"
 }
 
-// duckDBExtLDFlags computes the verified static-link flags for the
-// DuckDB-tagged aggregator cross-compile (the recipe from
-// .scratch/duck-store/02-cgo-build-research.md, mirroring the Makefile's
-// build-agg-duckdb): a naive -static links but then segfaults at DuckDB
-// startup, because under a pre-2.34 glibc libstdc++ probes weak pthread
-// symbols and only the pthread archive members that resolved some reference
-// get linked in — leaving DuckDB's scheduler with no-op mutexes.
-// Whole-archiving libpthread.a fixes it; --allow-multiple-definition absorbs
-// the byte-identical members Go's own -lpthread already pulled in. The archive
-// must be passed by explicit path (resolved via the cross CC), not -lpthread.
+// duckDBExtLDFlags returns the static-link flags for the duck aggregator (as
+// in the Makefile's build-agg-duckdb). A naive -static segfaults at DuckDB
+// startup: with pre-2.34 glibc, libstdc++ probes weak pthread symbols and only
+// referenced archive members get linked, leaving no-op mutexes. So libpthread.a
+// is whole-archived by explicit path, and --allow-multiple-definition absorbs
+// the members Go's own -lpthread already pulled in.
 func duckDBExtLDFlags(cc string) (string, error) {
 	out, err := exec.Command(cc, "-print-file-name=libpthread.a").Output()
 	if err != nil {
@@ -85,10 +68,7 @@ func duckDBExtLDFlags(cc string) (string, error) {
 	}
 	p := strings.TrimSpace(string(out))
 	if p == "" || !strings.HasSuffix(p, "libpthread.a") || filepath.Base(p) == p {
-		// gcc prints the argument back unchanged when it cannot resolve the
-		// file — a bare file name with no directory — which a suffix check
-		// alone would wave through as a bogus relative link path. Treat
-		// anything that is not a resolved path as a broken toolchain.
+		// gcc echoes the bare name back when it cannot resolve the file.
 		return "", fmt.Errorf("%s -print-file-name=libpthread.a returned %q (no libpthread.a in the toolchain?)", cc, p)
 	}
 	return fmt.Sprintf("-static -Wl,--allow-multiple-definition -Wl,--whole-archive %s -Wl,--no-whole-archive", p), nil
@@ -114,8 +94,7 @@ func waitStoreQueryReady(ctx context.Context, rt Runtime, container, addr, rpcKe
 		interval = 2 * time.Second
 	)
 	var lastErr string
-	// a real read of the tier the api queries: proves the whole path (TL, DuckDB, the
-	// ClickHouse compatibility views) is live, not merely that a TCP port is open
+	// A real read of the tier the api queries, not just an open TCP port.
 	args := tlstatshouse.StoreQuery{Sql: "SELECT toInt64(count(*)) AS n FROM statshouse_v6_1s_dist"}
 	if perr := poll(ctx, timeout, interval, func() (bool, error) {
 		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)

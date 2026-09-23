@@ -8,11 +8,8 @@ import (
 	"time"
 )
 
-// TestSignatureAlignment pins the key-prefix convention that lets the expected
-// model and the live API response compare equal: the API emits legacy tag IDs
-// "key"+index ("key0".."key5") while the generator's positional keys are bare
-// indices ("0".."5"), so expectedSignature prefixes the index with "key". It also
-// confirms tagSignature drops the _h host tag the go client injects.
+// TestSignatureAlignment pins that API tag IDs ("key0") match the generator's
+// bare positional keys ("0"), and that tagSignature drops the go client's _h tag.
 func TestSignatureAlignment(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -23,19 +20,12 @@ func TestSignatureAlignment(t *testing.T) {
 		{"tagged", map[string]apiMetaTag{"key0": {"alpha"}, "key1": {"beta"}}, []tag{{"0", "alpha"}, {"1", "beta"}}},
 		{"many", map[string]apiMetaTag{"key0": {"a"}, "key1": {"b"}, "key2": {"c"}, "key3": {"d"}, "key4": {"e"}, "key5": {"f"}},
 			[]tag{{"0", "a"}, {"1", "b"}, {"2", "c"}, {"3", "d"}, {"4", "e"}, {"5", "f"}}},
-		// The _h host tag is added by the client, never generated; it must be stripped
-		// so an API series carrying it still matches the (host-free) expected series.
+		// _h is injected by the client, never generated.
 		{"_h stripped", map[string]apiMetaTag{"key0": {"val"}, "_h": {"host-abc"}}, []tag{{"0", "val"}}},
-		// rust/cpp send empty tag values verbatim (no client-side drop like go); the
-		// API may surface them, so tagSignature must drop them to stay equal to the
-		// empty-free expected series (normalizeTags already dropped the empty tag).
+		// rust/cpp send empty tag values verbatim, unlike go.
 		{"empty value dropped", map[string]apiMetaTag{"key0": {"val"}, "key1": {""}}, []tag{{"0", "val"}}},
-		// A series written with fewer tags than the qb covers has its absent
-		// position materialized by the API as the sentinel " 0" (tag value ID 0,
-		// rendered with a leading space). The expected model has no entry for an
-		// absent position, so tagSignature must drop the sentinel (" 0" trims to
-		// "0"); the present tag alone identifies the series. (A real "0" value is
-		// never generated, so this never over-drops.)
+		// The API renders an absent grouped position as " 0" (tag value ID 0); a
+		// real "0" value is never generated, so dropping it never over-drops.
 		{"sentinel absent-position dropped", map[string]apiMetaTag{"key0": {"m0"}, "key1": {" 0"}}, []tag{{"0", "m0"}}},
 	}
 	for _, tc := range cases {
@@ -47,8 +37,6 @@ func TestSignatureAlignment(t *testing.T) {
 	}
 }
 
-// mkSeriesResp builds an apiSeriesResponse with one value per (series, bucket)
-// for the comparators under test.
 func mkSeriesResp(metas []apiSeriesMeta, data [][]float64, samplingAgg float64, base uint32, nb int) *apiSeriesResponse {
 	times := make([]int64, nb)
 	for i := 0; i < nb; i++ {
@@ -60,9 +48,7 @@ func mkSeriesResp(metas []apiSeriesMeta, data [][]float64, samplingAgg float64, 
 	}}
 }
 
-// TestCompareCounts covers the counter comparator's four failure modes: a count
-// mismatch, a missing expected series, an EXTRA series, and the sampling
-// tripwire that must fail even when counts match exactly.
+// TestCompareCounts: the sampling tripwire must fail even when counts match.
 func TestCompareCounts(t *testing.T) {
 	base := uint32(1_700_000_000)
 	m := metricModel{Name: "e2e_x_go_c_multi", Kind: kindCounter, QBKeys: []string{"0", "1"}, Series: []seriesModel{{
@@ -122,8 +108,8 @@ func TestCompareCounts(t *testing.T) {
 	})
 }
 
-// TestCompareValueAgg pins the value exact aggregates computed in WRITE ORDER
-// (the agent's ValueSum left-fold), including a negative avg.
+// TestCompareValueAgg: exact aggregates are computed in write order (the
+// agent's ValueSum left-fold).
 func TestCompareValueAgg(t *testing.T) {
 	base := uint32(1_700_000_000)
 	vals := []float64{-3.5, -0.01, 2.718281828459045, 100.0}
@@ -140,15 +126,14 @@ func TestCompareValueAgg(t *testing.T) {
 			t.Errorf("qw=%s expected %g not exact: mm=%v miss=%v ex=%v samp=%g", qw, exp, mm, miss, ex, samp)
 		}
 	}
-	// A wrong value is caught.
+
 	resp := mkSeriesResp([]apiSeriesMeta{wantMeta}, [][]float64{{valueAggregate(vals, "sum") + 1}}, 0, base, 1)
 	if mm, _, _, _ := compareByFunc(m, resp, queryFunc{qw: "sum"}); len(mm) != 1 {
 		t.Errorf("sum mismatch not flagged: %v", mm)
 	}
 }
 
-// TestComparePercentile pins the tolerance band: a t-digest result within tol of
-// the true type-7 quantile passes; outside fails.
+// TestComparePercentile pins the tolerance band around the true type-7 quantile.
 func TestComparePercentile(t *testing.T) {
 	base := uint32(1_700_000_000)
 	vals := genValueUniform(1000) // sorted; p50=499.5
@@ -170,11 +155,9 @@ func TestComparePercentile(t *testing.T) {
 	}
 }
 
-// TestComparePercentileSkewBand pins the widened band for the SKEWED generator:
-// its steep inverse CDF amplifies t-digest quantile-space error past the flat
-// 1% band (observed live: p50 +1.09% on CH itself with count/sum exact), so
-// those series are held to percentileSkewTol instead — while a uniform series
-// in the SAME metric keeps the 1% band.
+// TestComparePercentileSkewBand: the skewed generator's steep inverse CDF pushes
+// t-digest error past 1% (even on CH), so it gets percentileSkewTol; the band is
+// per-generator, so a uniform series in the same metric keeps 1%.
 func TestComparePercentileSkewBand(t *testing.T) {
 	base := uint32(1_700_000_000)
 	skewVals := genValueSkewed(1000) // sorted; steep inverse CDF near the median
@@ -192,22 +175,20 @@ func TestComparePercentileSkewBand(t *testing.T) {
 	if mm, _, _, _ := compareByFunc(m, resp, queryFunc{qw: "p50", q: 0.5}); len(mm) != 0 {
 		t.Errorf("+4%% on the skew series should pass under the 5%% band (truth=%g got=%g): %v", truth, got, mm)
 	}
-	// The same +4% on the UNIFORM series must still fail — the band is
-	// per-generator, not metric-wide.
+
 	unifTruth := quantile(genValueUniform(1000), 0.5)
 	resp = mkSeriesResp([]apiSeriesMeta{unifMeta}, [][]float64{{unifTruth * 1.04}}, 0, base, 1)
 	if mm, _, _, _ := compareByFunc(m, resp, queryFunc{qw: "p50", q: 0.5}); len(mm) != 1 {
 		t.Errorf("+4%% on the uniform series must fail the 1%% band (truth=%g): %v", unifTruth, mm)
 	}
-	// +7% on the skew series exceeds even the widened band.
+
 	resp = mkSeriesResp([]apiSeriesMeta{skewMeta}, [][]float64{{truth * 1.07}}, 0, base, 1)
 	if mm, _, _, _ := compareByFunc(m, resp, queryFunc{qw: "p50", q: 0.5}); len(mm) != 1 {
 		t.Errorf("+7%% on the skew series should fail the 5%% band (truth=%g): %v", truth, mm)
 	}
 }
 
-// TestCompareUnique pins both unique modes: exact for the small case, ±2% for the
-// big case (the comparator switches on distinct > uniquesHashMaxSize).
+// TestCompareUnique: exact up to uniquesHashMaxSize distinct, ±2% above.
 func TestCompareUnique(t *testing.T) {
 	base := uint32(1_700_000_000)
 	mk := func(distinct int) metricModel {
@@ -218,7 +199,6 @@ func TestCompareUnique(t *testing.T) {
 	}
 	wantMeta := apiSeriesMeta{Tags: map[string]apiMetaTag{"key0": {"s"}}}
 
-	// Exact (300 distinct): 300 passes, 299 fails.
 	m := mk(smallUniqueDistinct)
 	resp := mkSeriesResp([]apiSeriesMeta{wantMeta}, [][]float64{{300}}, 0, base, 1)
 	if mm, _, _, _ := compareByFunc(m, resp, queryFunc{qw: "unique"}); len(mm) != 0 {
@@ -229,7 +209,6 @@ func TestCompareUnique(t *testing.T) {
 		t.Errorf("exact 299 should fail: %v", mm)
 	}
 
-	// Approx (100000 distinct, ±2% → [98000,102000]): 101500 passes, 97000 fails.
 	m = mk(bigUniqueDistinct)
 	resp = mkSeriesResp([]apiSeriesMeta{wantMeta}, [][]float64{{101500}}, 0, base, 1)
 	if mm, _, _, _ := compareByFunc(m, resp, queryFunc{qw: "unique"}); len(mm) != 0 {
@@ -241,8 +220,6 @@ func TestCompareUnique(t *testing.T) {
 	}
 }
 
-// TestCompareCardinality pins the stag assertion: a single total series whose
-// per-bucket value equals the distinct-series count.
 func TestCompareCardinality(t *testing.T) {
 	base := uint32(1_700_000_000)
 	m := metricModel{Name: "e2e_x_go_s_dist", Kind: kindStag, Series: []seriesModel{
@@ -251,7 +228,7 @@ func TestCompareCardinality(t *testing.T) {
 		{Tags: nil, Counts: map[uint32]float64{base: 1}}, // empty-value series
 	}}
 	total := apiSeriesMeta{Tags: map[string]apiMetaTag{}} // no group-by → signature ""
-	// 3 distinct series at the bucket → cardinality 3 passes.
+	// 3 distinct series at the bucket.
 	resp := mkSeriesResp([]apiSeriesMeta{total}, [][]float64{{3}}, 0, base, 1)
 	if mm, miss, ex, samp := compareByFunc(m, resp, queryFunc{qw: "cardinality"}); len(mm) != 0 || len(miss) != 0 || len(ex) != 0 || samp != 0 {
 		t.Errorf("cardinality 3 should pass clean: mm=%v miss=%v ex=%v samp=%g", mm, miss, ex, samp)
@@ -262,13 +239,9 @@ func TestCompareCardinality(t *testing.T) {
 	}
 }
 
-// TestCompareMetaNonCollision proves the comparison is structurally immune to the
-// client meta-metrics every driver ALSO writes (statshouse_transport_metrics,
-// __src_client_write_err, …). Those are different metric names, so
-// /api/query?s=<exact e2e name> never returns their series — and defensively,
-// even if one appeared in a response, compareByFunc keys on the EXACT normalized
-// tag signature, so it can only ever surface as an extra (caught), never silently
-// merge into an expected e2e series.
+// TestCompareMetaNonCollision: client meta-metrics (statshouse_transport_metrics,
+// __src_client_write_err) are never queried, and if one did appear it could only
+// surface as an extra, never merge into an expected series.
 func TestCompareMetaNonCollision(t *testing.T) {
 	base := uint32(1_700_000_000)
 	const e2eName = "e2e_runid_go_c_tagged"
@@ -306,16 +279,13 @@ func TestCompareMetaNonCollision(t *testing.T) {
 	})
 }
 
-// TestClientWriteErrForLang pins the silent-loss tripwire's series scan: it finds
-// the querying client's language (the metric is grouped at qb=1 so the lang is the
-// single series_meta tag) and reports any non-zero lost-bytes bucket, while
-// ignoring other clients' languages, zero buckets, and the absent-position
-// sentinel that trims to "0" (never equal to a real lang 1/3/5).
+// TestClientWriteErrForLang: the silent-loss scan ignores other languages, zero
+// buckets and the absent-position sentinel " 0".
 func TestClientWriteErrForLang(t *testing.T) {
 	base := uint32(1_700_000_000)
 	goLang := apiSeriesMeta{Tags: map[string]apiMetaTag{"key1": {"1"}}}
 	rustLang := apiSeriesMeta{Tags: map[string]apiMetaTag{"key1": {"3"}}}
-	// A loss point for go at base (non-zero); rust's only bucket is 0 (no loss).
+	// go lost bytes at base; rust's only bucket is 0.
 	resp := &apiSeriesResponse{Data: apiResponseData{Series: apiSeries{
 		Time: []int64{int64(base)}, SeriesMeta: []apiSeriesMeta{goLang, rustLang}, SeriesData: [][]float64{{2048}, {0}},
 	}}}
@@ -325,9 +295,7 @@ func TestClientWriteErrForLang(t *testing.T) {
 	if _, found := clientWriteErrForLang(resp, "3"); found {
 		t.Error("rust falsely flagged: its only bucket is 0 (no loss)")
 	}
-	// A series_meta carrying the absent-position sentinel " 0" (trims to "0") must
-	// not be mistaken for any real client language (1/3/5) even with a non-zero
-	// value — the sentinel marks an absent grouped position, not a language.
+
 	sentinel := apiSeriesMeta{Tags: map[string]apiMetaTag{"key1": {" 0"}}}
 	resp2 := &apiSeriesResponse{Data: apiResponseData{Series: apiSeries{
 		Time: []int64{int64(base)}, SeriesMeta: []apiSeriesMeta{sentinel}, SeriesData: [][]float64{{99}},
@@ -339,21 +307,17 @@ func TestClientWriteErrForLang(t *testing.T) {
 	}
 }
 
-// scriptedResp is one scripted absence-query result.
 type scriptedResp struct {
 	val float64
 	err error
 }
 
-// scriptedQuery replays a fixed list of responses for an absence poll. Once the
-// list is exhausted it repeats the LAST entry forever, so an all-error or all-zero
-// script stays uniform across as many iterations as poll drives.
+// scriptedQuery replays resps, repeating the last one once exhausted.
 type scriptedQuery struct {
 	resps []scriptedResp
 	n     int
 }
 
-// scripted builds an injectable absenceQueryFunc backed by s.
 func scripted(s *scriptedQuery) absenceQueryFunc {
 	return func(ctx context.Context) (float64, error) {
 		i := s.n
@@ -366,16 +330,11 @@ func scripted(s *scriptedQuery) absenceQueryFunc {
 	}
 }
 
-// TestPollAbsenceTripwire pins the four outcomes of the fail-closed absence poll:
-// (1) every query erroring for the whole window FAILS CLOSED — a down stack never
-// passes for "absent"; (2) a clean zero confirms absence → pass; (3) a non-zero
-// point fails FAST (before the timeout); (4) errors followed by a later clean zero
-// still pass (one clean observation suffices). The query func is the seam, so this
-// needs no live API.
+// TestPollAbsenceTripwire: the absence poll fails closed when every query errors
+// (a down stack never passes for "absent"), and fails fast on a non-zero point.
 func TestPollAbsenceTripwire(t *testing.T) {
 	ctx := context.Background()
-	// Short window/interval so the test is sub-100ms; the fail-fast case asserts it
-	// ends well before `to`, so the exact magnitudes are not load-bearing.
+
 	const to = 100 * time.Millisecond
 	const iv = 5 * time.Millisecond
 	errBoom := errors.New("api unreachable")

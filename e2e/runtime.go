@@ -8,77 +8,60 @@ import (
 	"strings"
 )
 
-// Runtime abstracts the container CLI the harness shells out to. Two
-// implementations exist: apple/container (default on macOS) and docker
-// (default on Linux). apple/container has no stable Go API, so
-// CLI shell-out is the supported path.
+// Runtime abstracts the container CLI the harness shells out to:
+// apple/container (default on macOS; it has no stable Go API) or docker.
 type Runtime interface {
-	// Name returns "container" or "docker".
 	Name() string
 
-	// HasNetworkEgress reports whether containers can reach the public network.
-	// docker (NAT egress) → true; apple/container (no in-container network) → false.
-	// The --with-ui build relies on this to decide between an online container
-	// npm install (docker) and a host-populated offline cache (apple/container).
+	// HasNetworkEgress reports whether containers can reach the public network
+	// (docker yes, apple/container no); --with-ui picks its npm install mode by it.
 	HasNetworkEgress() bool
 
-	// EnsureSystem makes the runtime ready to run containers. On apple/container
-	// it runs `container system status` and auto-starts the services if needed;
-	// on docker it verifies the daemon responds to `docker info`.
+	// EnsureSystem makes the runtime ready, auto-starting apple/container's
+	// system services if needed.
 	EnsureSystem(ctx context.Context) error
 
-	// CheckVersion enforces the pinned CLI version (apple/container only; the
-	// spec pins per-release to catch CLI drift). docker is a no-op in v1.
+	// CheckVersion enforces the pinned apple/container CLI version; no-op on docker.
 	CheckVersion(ctx context.Context) error
 
-	// NetworkCreate / NetworkRemove / NetworkList manage per-run networks.
 	NetworkCreate(ctx context.Context, name string) error
 	NetworkRemove(ctx context.Context, name string) error
 	NetworkList(ctx context.Context) ([]string, error)
 
-	// Run starts a container (detached for service containers). See RunOpts.
 	Run(ctx context.Context, opts RunOpts) error
 
-	// Exec runs a command in a running container and returns stdout and the
-	// process exit code. stderr is surfaced only via the returned error when the
-	// command fails to launch.
+	// Exec returns stdout and the exit code; err only when the command cannot launch.
 	Exec(ctx context.Context, containerID string, cmd []string) (stdout string, exitCode int, err error)
 
-	// Logs fetches the container's accumulated logs.
 	Logs(ctx context.Context, containerID string) (string, error)
 
-	// Stop stops a running container.
 	Stop(ctx context.Context, containerID string) error
 
-	// Rm removes a container; force removes it even while running.
 	Rm(ctx context.Context, containerID string, force bool) error
 
-	// ContainerList returns the IDs/names of all containers (running or not),
-	// used to prune stale e2e-* resources from prior runs.
+	// ContainerList returns all containers, running or not.
 	ContainerList(ctx context.Context) ([]string, error)
 
-	// InspectIP returns the container's IPv4 on the given network, without the
-	// CIDR prefix. All inter-service wiring is by IP: apple/container in-container
-	// DNS does not resolve container names (verified on this machine).
+	// InspectIP returns the container's IPv4 on network, without the CIDR
+	// prefix. Wiring is by IP: apple/container DNS does not resolve names.
 	InspectIP(ctx context.Context, containerID, network string) (string, error)
 }
 
-// RunOpts configures Runtime.Run. Bind mounts and publish specs use docker-style
-// syntax ("src:dst[:ro]" and "[host-ip:]host:container[/proto]"); both CLIs accept it.
+// RunOpts configures Runtime.Run. Volumes and Ports use docker-style syntax,
+// which both CLIs accept.
 type RunOpts struct {
-	Name    string   // container name (also its ID on apple/container)
-	Image   string   // image reference
-	Network string   // network to attach to
+	Name    string
+	Image   string
+	Network string
 	Env     []string // KEY=VAL
-	Volumes []string // bind mounts, "src:dst[:ro]"
-	Ports   []string // publish specs
-	Cmd     []string // image entrypoint arguments
-	Detach  bool     // run detached (daemon); the common case for services
-	AutoRm  bool     // remove the container when its process exits
+	Volumes []string // "src:dst[:ro]"
+	Ports   []string // "[host-ip:]host:container[/proto]"
+	Cmd     []string
+	Detach  bool
+	AutoRm  bool
 }
 
-// buildRunArgs renders RunOpts as the args for the `run` subcommand, common to
-// both CLIs (apple/container and docker accept the same flags in this order).
+// buildRunArgs renders RunOpts as `run` args; both CLIs accept the same flags.
 func buildRunArgs(opts RunOpts) []string {
 	args := []string{"run"}
 	if opts.Detach {
@@ -107,8 +90,7 @@ func buildRunArgs(opts RunOpts) []string {
 	return args
 }
 
-// selectRuntime resolves which Runtime to use: an explicit --runtime flag wins,
-// otherwise auto-detect by GOOS + binary on PATH (darwin→container, linux→docker).
+// selectRuntime returns the --runtime choice, else auto-detects by GOOS and PATH.
 func selectRuntime(flag string) (Runtime, error) {
 	name := flag
 	if name == "" {
@@ -128,8 +110,6 @@ func selectRuntime(flag string) (Runtime, error) {
 }
 
 func autoDetectRuntime() string {
-	// darwin prefers apple/container; linux prefers docker. The non-preferred
-	// binary is used as a fallback if the preferred one is absent.
 	switch runtime.GOOS {
 	case "darwin":
 		if lookPath("container") {
@@ -161,11 +141,9 @@ func lookPath(name string) bool {
 	return err == nil
 }
 
-// resourceInList reports whether name appears in the given lister's output. Used
-// to make Rm/NetworkRemove idempotent (a missing resource is success) without
-// depending on error-message wording, which drifts between CLI releases. A list
-// error is surfaced rather than treated as "absent" — otherwise Rm/NetworkRemove
-// would silently no-op and leak the resource.
+// resourceInList makes Rm/NetworkRemove idempotent without matching CLI error
+// wording, which drifts between releases. A list error is returned, not treated
+// as absent, so a resource is never silently leaked.
 func resourceInList(ctx context.Context, list func(context.Context) ([]string, error), name string) (bool, error) {
 	items, err := list(ctx)
 	if err != nil {
@@ -179,9 +157,8 @@ func resourceInList(ctx context.Context, list func(context.Context) ([]string, e
 	return false, nil
 }
 
-// execResult captures a finished command's output. err is set only when the
-// process could not be launched (binary missing, context cancelled); a non-zero
-// exit code is surfaced via exitCode, not err, so callers can inspect it.
+// execResult captures a finished command's output; run reports a non-zero exit
+// via exitCode, not an error.
 type execResult struct {
 	stdout   string
 	stderr   string
@@ -196,9 +173,7 @@ func run(ctx context.Context, name string, args ...string) (execResult, error) {
 	err := cmd.Run()
 	res := execResult{stdout: out.String(), stderr: errb.String()}
 	if err != nil {
-		// If the context was cancelled (deadline or signal), say so explicitly —
-		// CommandContext kills the process and Run otherwise surfaces a confusing
-		// "exit -1" / "signal: killed".
+		// Otherwise a cancelled ctx surfaces as a confusing "signal: killed".
 		if ctx.Err() != nil {
 			return res, fmt.Errorf("%s: %w", cmdStr(name, args), ctx.Err())
 		}

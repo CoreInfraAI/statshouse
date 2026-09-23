@@ -1,12 +1,7 @@
 package main
 
-// Unit tests for the harness's storage-backend swap: flag parsing, daemon
-// spec selection (which aggregator binary a backend cross-compiles and how),
-// and the per-backend daemon flag wiring (aggregator + api). Everything here
-// is pure host-side construction — no container, no daemon, no network — so a
-// wiring regression (a duck flag missing from the agg script, the api still
-// pointed at ClickHouse, the wrong binary mounted) fails in milliseconds
-// instead of after the full stack bring-up.
+// Host-only unit tests for the storage-backend wiring (daemon specs, agg and
+// api flags), so a wiring regression fails in milliseconds, not after bring-up.
 
 import (
 	"os"
@@ -17,10 +12,8 @@ import (
 	"testing"
 )
 
-// TestDaemonSpecsFor pins the per-backend build list: clickhouse builds the
-// usual four (one cgo daemon: metadata), duck swaps only the aggregator for
-// the duckdb-tagged static-cgo build cached under its own name, and the other
-// three daemons are byte-identical between backends.
+// TestDaemonSpecsFor: duck swaps only the aggregator (duckdb-tagged static-cgo
+// build under its own cache name); the other daemons are identical.
 func TestDaemonSpecsFor(t *testing.T) {
 	ch := daemonSpecsFor(backendClickHouse)
 	if len(ch) != 4 {
@@ -74,7 +67,6 @@ func TestAggBinName(t *testing.T) {
 	}
 }
 
-// findSpec returns the spec whose pkg matches, from the backend's build list.
 func findSpec(t *testing.T, backend storageBackend, pkg string) daemonSpec {
 	t.Helper()
 	for _, d := range daemonSpecsFor(backend) {
@@ -86,18 +78,13 @@ func findSpec(t *testing.T, backend storageBackend, pkg string) daemonSpec {
 	return daemonSpec{}
 }
 
-// TestDuckAggSpecCrossCompileFlags asserts the duck aggregator builds with the
-// duckdb tag and the verified static-link flags embedded in buildOneDaemon's
-// recipe. The extldflags computation itself needs a real toolchain and is
-// covered separately (TestDuckDBExtLDFlags); here the spec the build branches
-// on is what matters.
 func TestDuckAggSpecCrossCompileFlags(t *testing.T) {
 	agg := findSpec(t, backendDuck, "./cmd/statshouse-agg")
 	if !agg.duckDB {
 		t.Fatal("the duck agg spec must carry duckDB (the -tags duckdb + static-link path in buildOneDaemon)")
 	}
-	// osusergo is load-bearing for the static link: without it the cgo
-	// getgrnam cannot resolve even "root" and the agg dies at ChangeUserGroup
+	// osusergo: without it the static cgo getgrnam cannot resolve even "root"
+	// and the agg dies at ChangeUserGroup
 	for _, tag := range []string{"duckdb", "osusergo"} {
 		if !strings.Contains(" "+duckBuildTags+" ", " "+tag+" ") {
 			t.Fatalf("duckBuildTags %q must carry %q", duckBuildTags, tag)
@@ -109,14 +96,9 @@ func TestDuckAggSpecCrossCompileFlags(t *testing.T) {
 	}
 }
 
-// TestDuckDBExtLDFlags exercises the verified static-link flag computation
-// against a real compiler: the flags must contain the whole-archive pthread
-// recipe with the archive resolved by explicit path. A toolchain that has no
-// libpthread.a at all (e.g. Apple clang, where pthread lives in libSystem)
-// answers with the bare-name echo-back, which must surface as an error — the
-// production path only ever passes a linux cross-compiler, which ships the
-// archive. Skipped when no compiler is on PATH (not the machine that runs the
-// harness).
+// TestDuckDBExtLDFlags runs the static-link flag computation against a real
+// compiler. A toolchain without libpthread.a (e.g. Apple clang) must error;
+// production only passes a linux cross-compiler, which ships it.
 func TestDuckDBExtLDFlags(t *testing.T) {
 	cc := ""
 	for _, cand := range []string{"cc", "clang", "gcc"} {
@@ -129,17 +111,12 @@ func TestDuckDBExtLDFlags(t *testing.T) {
 		t.Skip("no C compiler on PATH to resolve libpthread.a")
 	}
 
-	// A CC that cannot resolve the archive (or does not exist) must fail the
-	// build loudly rather than emit a broken link line — no real toolchain
-	// needed for either check.
 	if _, err := duckDBExtLDFlags("definitely-not-a-compiler"); err == nil {
 		t.Error("duckDBExtLDFlags with a nonexistent CC must fail")
 	}
 
-	// gcc's cannot-resolve behaviour is to echo the argument back unchanged —
-	// a bare file name with no directory, which passes a suffix check and
-	// would ride into the link flags as a bogus relative path. It must be
-	// rejected as a broken toolchain.
+	// gcc echoes an unresolvable name back bare, which would pass a suffix
+	// check and ride into the link flags as a bogus relative path.
 	echoBack := filepath.Join(t.TempDir(), "cc-echo")
 	if err := os.WriteFile(echoBack, []byte("#!/bin/sh\necho libpthread.a\n"), 0o755); err != nil {
 		t.Fatal(err)
@@ -150,8 +127,7 @@ func TestDuckDBExtLDFlags(t *testing.T) {
 
 	flags, err := duckDBExtLDFlags(cc)
 	if err != nil {
-		// legitimate on a toolchain without libpthread.a; everything below
-		// assumes one that ships it
+		// legitimate on a toolchain without libpthread.a
 		t.Skipf("%s cannot resolve libpthread.a (%v) — not a toolchain this recipe applies to", cc, err)
 	}
 	for _, want := range []string{"-static", "-Wl,--allow-multiple-definition", "-Wl,--whole-archive", "-Wl,--no-whole-archive"} {
@@ -177,9 +153,8 @@ func testStackOpts(backend storageBackend) daemonStackOpts {
 	}
 }
 
-// TestAggRunScriptDuckFlags pins the duck aggregator's entrypoint: the duck
-// block is present with the store dir, the shard is named locally (there is no
-// ClickHouse cluster to autodetect from), and no --kh is passed.
+// TestAggRunScriptDuckFlags: the shard is named locally since there is no
+// ClickHouse cluster to autodetect it from.
 func TestAggRunScriptDuckFlags(t *testing.T) {
 	script := aggRunScript(testStackOpts(backendDuck), "10.77.0.2")
 	for _, want := range []string{
@@ -197,10 +172,8 @@ func TestAggRunScriptDuckFlags(t *testing.T) {
 	}
 }
 
-// TestAggRunScriptSharedFlags pins the flags both backends share verbatim —
-// the known e2e hazards (insert sampler, receive-budget warming, agent
-// sampling) must be neutralized identically under duck, whose write path
-// rides the same machinery.
+// TestAggRunScriptSharedFlags: the e2e sampling/budget hazards must be
+// neutralized identically under duck, whose write path shares the machinery.
 func TestAggRunScriptSharedFlags(t *testing.T) {
 	for _, backend := range []storageBackend{backendClickHouse, backendDuck} {
 		script := aggRunScript(testStackOpts(backend), "10.77.0.2")
@@ -221,8 +194,6 @@ func TestAggRunScriptSharedFlags(t *testing.T) {
 	}
 }
 
-// TestAggRunScriptClickHouseFlags pins the clickhouse aggregator's entrypoint:
-// the ClickHouse address is present and no duck flag leaks in.
 func TestAggRunScriptClickHouseFlags(t *testing.T) {
 	script := aggRunScript(testStackOpts(backendClickHouse), "10.77.0.2")
 	if !strings.Contains(script, "--kh=10.77.0.9:8123") {
@@ -235,8 +206,6 @@ func TestAggRunScriptClickHouseFlags(t *testing.T) {
 	}
 }
 
-// TestAPIDaemonFlagsDuck pins the duck api wiring: the api reads through the
-// aggregator (the single shard the stack runs) instead of ClickHouse.
 func TestAPIDaemonFlagsDuck(t *testing.T) {
 	flags := strings.Join(apiDaemonFlags(testStackOpts(backendDuck), "10.77.0.2", "10.77.0.3"), " ")
 	for _, want := range []string{
@@ -252,8 +221,6 @@ func TestAPIDaemonFlagsDuck(t *testing.T) {
 	}
 }
 
-// TestAPIDaemonFlagsShared pins the flags both backends share, and the
-// clickhouse storage wiring (three-replica cluster shape, no duck flags).
 func TestAPIDaemonFlagsSharedAndClickHouse(t *testing.T) {
 	for _, backend := range []storageBackend{backendClickHouse, backendDuck} {
 		flags := strings.Join(apiDaemonFlags(testStackOpts(backend), "10.77.0.2", "10.77.0.3"), " ")

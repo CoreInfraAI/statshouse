@@ -13,16 +13,9 @@ import (
 	"time"
 )
 
-// daemonSpec describes one daemon to cross-compile. cgo is true for daemons that
-// cannot build without CGO (the metadata uses sqlite via the C amalgamation in
-// internal/sqlite/sqlite0). The others build static with CGO_ENABLED=0.
-//
-// NOTE: all four daemons build with CGO_ENABLED=0.
-// That holds for agg/api/agent but NOT metadata — sqlite0 is a cgo package, so
-// `CGO_ENABLED=0` yields "build constraints exclude all Go files". The project's
-// own Makefile confirms this: it builds statshouse-metadata with plain `go build`
-// (CGO on). The harness builds metadata with CGO + a static C cross-link so the
-// result is still a single static binary that runs on the same alpine base.
+// daemonCmds are the daemons to cross-compile. metadata needs cgo (sqlite0 is a
+// cgo package), so it is built with a static C cross-link to still run on the
+// alpine base; the rest build with CGO_ENABLED=0.
 var daemonCmds = []daemonSpec{
 	{bin: "statshouse-metadata", pkg: "./cmd/statshouse-metadata", cgo: true},
 	{bin: "statshouse-agg", pkg: "./cmd/statshouse-agg", cgo: false},
@@ -30,32 +23,22 @@ var daemonCmds = []daemonSpec{
 	{bin: "statshouse", pkg: "./cmd/statshouse", cgo: false},
 }
 
-// duckBuildTags is the DuckDB-tagged aggregator's build-tag set: duckdb for
-// the store itself, osusergo so os/user reads /etc/group directly instead of
-// going through the cgo getgrnam a static glibc link cannot serve (no NSS
-// modules to dlopen) — the agg's fatal ChangeUserGroup would otherwise kill
-// the daemon at startup.
+// duckBuildTags: osusergo makes os/user read /etc/group directly, since a
+// static glibc link cannot serve cgo getgrnam (no NSS modules) and the agg's
+// fatal ChangeUserGroup would kill it at startup.
 const duckBuildTags = "duckdb osusergo"
 
 type daemonSpec struct {
 	bin string
 	pkg string
 	cgo bool
-	// duckDB marks the DuckDB-tagged aggregator build (--storage-backend=duck):
-	// compiled with -tags duckdb and linked with the verified static cgo recipe
-	// (duckDBExtLDFlags), following the same cross-CC precedent as the metadata
-	// daemon. Cached under its own bin name (see daemonSpecsFor).
+	// duckDB marks the DuckDB-tagged aggregator, linked with duckDBExtLDFlags.
 	duckDB bool
 }
 
-// buildDaemons cross-compiles the daemons for the runtime arch:
-// GOOS=linux GOARCH=<arch>) into a cache dir shared across runs
-// (~/.cache/statshouse-e2e/bin/<arch>/). A binary whose cached copy is newer than
-// the newest source file is reused verbatim, so a no-change rerun is instant and
-// any source edit triggers a (fast, Go-build-cache-backed) rebuild. Under the
-// duck backend the aggregator builds as the DuckDB-tagged static binary
-// (statshouse-agg-duck) alongside the unchanged metadata/api/agent. log receives
-// a one-line summary. Returns the cache dir holding the binaries.
+// buildDaemons cross-compiles the daemons for linux/<arch> into a cache dir
+// shared across runs and returns it. A cached binary newer than the newest
+// source file is reused.
 func buildDaemons(ctx context.Context, repoRoot, arch string, backend storageBackend, log func(string, ...any)) (string, error) {
 	binDir, err := daemonBinDir(arch)
 	if err != nil {
@@ -70,8 +53,6 @@ func buildDaemons(ctx context.Context, repoRoot, arch string, backend storageBac
 		return "", fmt.Errorf("scan daemon source mtimes: %w", err)
 	}
 	start := time.Now()
-	// Collect the stale binaries first (the stat is cheap; only the rebuilds
-	// overlap). A cached copy newer than the newest source is reused verbatim.
 	type pending struct {
 		d   daemonSpec
 		out string
@@ -80,15 +61,12 @@ func buildDaemons(ctx context.Context, repoRoot, arch string, backend storageBac
 	for _, d := range specs {
 		out := filepath.Join(binDir, d.bin)
 		if fi, statErr := os.Stat(out); statErr == nil && fi.ModTime().After(newest) {
-			continue // cached copy is fresher than any source
+			continue
 		}
 		stale = append(stale, pending{d, out})
 	}
-	// Fan the stale builds out concurrently. Each writes a distinct output binary
-	// and compiles a distinct command package, so the builds are independent; the
-	// slow CGO metadata build (sqlite3.c) overlaps with the pure-Go daemons instead
-	// of gating them. `go build` serializes its own GOCACHE access, so concurrent
-	// invocations are safe.
+	// Build concurrently so the slow cgo metadata build (sqlite3.c) overlaps the
+	// pure-Go daemons; `go build` is safe to run concurrently on one GOCACHE.
 	results := make([]error, len(stale))
 	var wg sync.WaitGroup
 	for i := range stale {
@@ -99,8 +77,7 @@ func buildDaemons(ctx context.Context, repoRoot, arch string, backend storageBac
 		}(i)
 	}
 	wg.Wait()
-	// Report the first error in declaration order so a multi-failure surfaces a
-	// deterministic cause (metadata before agg/api/agent).
+	// First error in declaration order, for a deterministic cause.
 	for i := range stale {
 		if results[i] != nil {
 			return "", results[i]
@@ -110,14 +87,10 @@ func buildDaemons(ctx context.Context, repoRoot, arch string, backend storageBac
 	return binDir, nil
 }
 
-// buildOneDaemon runs `go build` for one command with the right CGO env. CGO
-// daemons are linked static (-static) against the C cross-toolchain's libc so the
-// result is a single self-contained binary that runs on the alpine base image.
-// The DuckDB-tagged aggregator additionally uses the verified whole-archive
-// pthread recipe via -extldflags — environment CGO_LDFLAGS is emitted before the
-// package's own LDFLAGS on the link line, so a static flag there cannot satisfy
-// DuckDB's archive (verified with go build -x; see
-// .scratch/duck-store/02-cgo-build-research.md).
+// buildOneDaemon runs `go build` for one command. cgo daemons link static so
+// they run on the alpine base. The duck aggregator passes its link recipe via
+// -extldflags: CGO_LDFLAGS lands before the package's own LDFLAGS on the link
+// line, so it cannot satisfy DuckDB's archive.
 func buildOneDaemon(ctx context.Context, repoRoot, arch string, d daemonSpec, out string) error {
 	env := append(os.Environ(), "GOOS=linux", "GOARCH="+arch)
 	args := []string{"build", "-o", out}
@@ -138,8 +111,6 @@ func buildOneDaemon(ctx context.Context, repoRoot, arch string, d daemonSpec, ou
 		if err != nil {
 			return fmt.Errorf("build %s: %w", d.pkg, err)
 		}
-		// CGO_LDFLAGS=-static makes the external (C) link static; the resulting
-		// binary carries no dynamic libc, so it runs on alpine (musl) unchanged.
 		env = append(env, "CGO_ENABLED=1", "CC="+cc, "CGO_LDFLAGS=-static -s")
 	default:
 		env = append(env, "CGO_ENABLED=0")
@@ -160,15 +131,13 @@ func buildOneDaemon(ctx context.Context, repoRoot, arch string, d daemonSpec, ou
 	return nil
 }
 
-// crossCC resolves a C compiler that targets linux/<arch> for the CGO daemons.
-// Preference: the system cc when building natively on Linux for the host arch;
-// otherwise a glibc cross-compiler (needed because sqlite3.c uses glibc's
-// off64_t/pread64 LFS64 symbols, which musl does not provide). Static linking
-// then frees the binary from any specific libc at runtime.
+// crossCC resolves a C compiler targeting linux/<arch>: the native cc on a
+// matching Linux host, else a glibc cross-compiler (sqlite3.c needs glibc's
+// LFS64 symbols, which musl lacks).
 func crossCC(arch string) (string, error) {
 	var cands []string
 	if runtime.GOOS == "linux" && normalizeArch(runtime.GOARCH) == normalizeArch(arch) {
-		cands = append(cands, "cc", "gcc") // native build on Linux
+		cands = append(cands, "cc", "gcc")
 	}
 	switch normalizeArch(arch) {
 	case "arm64":
@@ -196,12 +165,8 @@ func normalizeArch(a string) string {
 	return a
 }
 
-// newestSourceMtime returns the newest mtime among the repo's *.go / go.mod /
-// go.sum files, skipping generated/local-only trees (vendor, git, the e2e
-// harness itself, scratch, the npm UI's statshouse-ui/build output). The
-// statshouse-ui/*.go sources ARE walked — they compile into the api daemon. Used
-// to decide whether cached daemon binaries are stale: any daemon-source edit
-// (cmd/, internal/, ...) bumps this past the cache.
+// newestSourceMtime returns the newest mtime among the repo's *.go, go.mod and
+// go.sum files, skipping trees that do not feed the daemons.
 func newestSourceMtime(repoRoot string) (time.Time, error) {
 	skip := map[string]bool{
 		".git": true, "node_modules": true, "e2e": true, ".scratch": true,
@@ -216,10 +181,8 @@ func newestSourceMtime(repoRoot string) (time.Time, error) {
 			if skip[d.Name()] {
 				return filepath.SkipDir
 			}
-			// statshouse-ui/*.go (embed/noembed) is compiled into the api daemon,
-			// so it must drive staleness; statshouse-ui/build is generated UI
-			// output. Scoped to statshouse-ui so internal/vkgo/build/version.go
-			// (real source) is still walked.
+			// statshouse-ui/*.go compiles into the api, but statshouse-ui/build is
+			// generated; other build/ dirs (internal/vkgo/build) are real source.
 			if d.Name() == "build" && strings.HasSuffix(filepath.Dir(path), "statshouse-ui") {
 				return filepath.SkipDir
 			}

@@ -6,21 +6,11 @@ import (
 	"testing"
 )
 
-// This file unit-tests the PURE logic — the parts of the rejection /
-// conservation-ledger machinery that do not touch the network or the live stack:
-// status-ID classification, ledger balance math, convergence predicates, the
-// seed-kind derivation, and the per-client rejection-metric generation. The
-// networked assertions themselves are exercised only by the full `go run ./e2e`
-// run (their correctness is pinned by the negative-proof step).
-//
-// Note on IDs vs names: the API renders the __src_ingestion_status tag2 as the
-// numeric VALUE ID (10=ok_cached, 23=err_nan_inf_value, …), NOT the name, so the
-// ledger works in int32 IDs throughout; the names are display-only.
+// Pure-logic tests for the rejection / conservation-ledger machinery. The API renders
+// __src_ingestion_status tag2 as the numeric value ID, so the ledger works in IDs;
+// names are display-only.
 
-// TestSeedKind pins that the rejected VALUE kinds (value_nan/value_inf) seed as a
-// plain VALUE write — the cold-start seed must be a VALID value=1 so auto-create
-// derives a value metric (the real, rejected NaN/+Inf writes follow pre-warm).
-// value/value_p likewise seed as value; unique as unique; counter/stag as counter.
+// Rejected value kinds seed with a valid value write so auto-create derives a value metric.
 func TestSeedKind(t *testing.T) {
 	cases := []struct {
 		kind string
@@ -41,10 +31,7 @@ func TestSeedKind(t *testing.T) {
 	}
 }
 
-// TestIngestionStatusName pins the ID→name map (display-only) and the warn_
-// classification the ledger uses to EXCLUDE warnings. A warn accompanies an accepted
-// event (still ok_cached), so counting it would double-count; isWarnStatus keys off
-// the "warn_" prefix the map assigns every warning status.
+// Warnings accompany an accepted (ok_cached) event, so the ledger must exclude them.
 func TestIngestionStatusName(t *testing.T) {
 	cases := map[int32]string{
 		10: "ok_cached",
@@ -77,10 +64,8 @@ func TestIngestionStatusName(t *testing.T) {
 	}
 }
 
-// TestClassifyIngestionSeries pins the by-key classification: key1 is the metric
-// NAME (pinned to `known`), key2 is the numeric status VALUE ID. Both read by their
-// rendered key; value-type fallbacks cover key-name drift. Sentinels and unknown
-// metrics are dropped (metric="" / statusID=0 → fetchIngestionBreakdown skips them).
+// key1 is the metric name (must be in known), key2 the status ID; value-type fallbacks
+// cover key-name drift, and unknown metrics or sentinels come back empty.
 func TestClassifyIngestionSeries(t *testing.T) {
 	known := map[string]bool{"e2e_run_go_v_nan": true, "e2e_run_go_c_zero": true}
 	cases := []struct {
@@ -100,21 +85,19 @@ func TestClassifyIngestionSeries(t *testing.T) {
 			"e2e_run_go_c_zero", 10,
 		},
 		{
-			// env (key0) present but not in known and not numeric → ignored.
+			// env (key0) is neither known nor numeric → ignored.
 			"env does not masquerade as metric",
 			map[string]apiMetaTag{"key0": {"production_env"}, "key1": {"e2e_run_go_v_nan"}, "key2": {"23"}},
 			"e2e_run_go_v_nan", 23,
 		},
 		{
-			// A status and metric both rendered with leading-space styling still match
-			// after TrimSpace.
+			// Leading-space rendering is trimmed before matching.
 			"leading-space id and metric match after trim",
 			map[string]apiMetaTag{"key1": {" e2e_run_go_c_zero"}, "key2": {" 62"}},
 			"e2e_run_go_c_zero", 62,
 		},
 		{
-			// Another run's metric (not in known) → status found, metric not (so the
-			// series is dropped from the breakdown).
+			// Another run's metric: the series is dropped.
 			"unknown metric dropped",
 			map[string]apiMetaTag{"key1": {"e2e_OTHER_RUN_v_nan"}, "key2": {"10"}},
 			"", 10,
@@ -125,8 +108,7 @@ func TestClassifyIngestionSeries(t *testing.T) {
 			"e2e_run_go_c_zero", 62,
 		},
 		{
-			// value-type fallback: tags rendered under non-standard keys still classify
-			// (the metric by known membership, the status by integer parse).
+			// Non-standard keys classify by known membership and integer parse.
 			"value-type fallback",
 			map[string]apiMetaTag{"keyX": {"e2e_run_go_v_nan"}, "keyY": {" 61"}},
 			"e2e_run_go_v_nan", 61,
@@ -151,11 +133,6 @@ func TestClassifyIngestionSeries(t *testing.T) {
 	}
 }
 
-// TestLedgerBalance pins the conservation split (keyed by status ID): ok_cached (10)
-// is the accepted total, Σ of every non-ok non-warn status is the rejected total, and
-// warnings are EXCLUDED (a warning accompanies an accepted event — still ok_cached —
-// so counting it would double-count). The per-status error AND warning breakdowns are
-// returned for diagnostics (warns feed ledgerFailDetail; they are not losses).
 func TestLedgerBalance(t *testing.T) {
 	byID := map[int32]float64{
 		statusIDOKCached:    70,
@@ -180,8 +157,7 @@ func TestLedgerBalance(t *testing.T) {
 	if !reflect.DeepEqual(errs, wantErrs) {
 		t.Errorf("errs = %v, want %v", errs, wantErrs)
 	}
-	// Warns are reported (for ledgerFailDetail diagnostics) but NOT added to either
-	// side of the balance — an accepted event with a warn is already in ok_cached.
+	// warns are reported for diagnostics but excluded from the balance
 	wantWarns := map[int32]float64{
 		55: 100,
 		33: 12,
@@ -190,37 +166,27 @@ func TestLedgerBalance(t *testing.T) {
 		t.Errorf("warns = %v, want %v", warns, wantWarns)
 	}
 
-	// An empty/nil breakdown balances to zero on both sides and reports no warns.
 	ok0, err0, errs0, warns0 := ledgerBalance(nil)
 	if ok0 != 0 || err0 != 0 || len(errs0) != 0 || len(warns0) != 0 {
 		t.Errorf("ledgerBalance(nil) = (%g, %g, %v, %v), want (0, 0, {}, {})", ok0, err0, errs0, warns0)
 	}
 }
 
-// TestLedgerFailDetailWarns pins that the imbalance diagnostic renders warn_* rows
-// (marked "warning — accepted, not a loss") alongside the err_* rows and ok_cached,
-// sorted by status ID, so a clamped-timestamp / unmapped-tag warning is visible for
-// diagnosis without being mistaken for a loss.
 func TestLedgerFailDetailWarns(t *testing.T) {
 	errs := map[int32]float64{statusIDZeroCounter: 5, 36: 2} // 62, 36
 	warns := map[int32]float64{55: 100, 33: 12}              // warn_*; 33 sorts before 55
 	const qurl = "http://api:10888/api/query?s=__src_ingestion_status&n=1000"
 	got := ledgerFailDetail("m", 70, 60, 7, errs, warns, qurl)
 
-	// ok_cached line and both err rows present.
 	assertContains(t, got, "ok_cached(10)=60")
 	assertContains(t, got, "err_map_tag_value(36)=2")
 	assertContains(t, got, "err_zero_counter(62)=5")
 
-	// Both warn rows present, marked as warnings (not losses), sorted 33 then 55.
 	assertContains(t, got, "warn_tag_not_found(33)=12 (warning — accepted, not a loss)")
 	assertContains(t, got, "warn_timestamp_clamped_past(55)=100 (warning — accepted, not a loss)")
 
-	// The failing __src_ingestion_status query URL is appended (F4) so the breakdown
-	// and the query it came from read together.
 	assertContains(t, got, "url: "+qurl)
 
-	// Warn rows must come AFTER every err row (errs printed first, then warns).
 	errPos := strings.Index(got, "err_zero_counter(62)=5")
 	warnPos := strings.Index(got, "warn_tag_not_found(33)=12")
 	if errPos < 0 || warnPos < 0 || warnPos < errPos {
@@ -228,7 +194,6 @@ func TestLedgerFailDetailWarns(t *testing.T) {
 	}
 }
 
-// assertContains is a small helper so the detail tests read like t.Errorf lines.
 func assertContains(t *testing.T, got, want string) {
 	t.Helper()
 	if !strings.Contains(got, want) {
@@ -236,12 +201,8 @@ func assertContains(t *testing.T, got, want string) {
 	}
 }
 
-// TestLedgerEligibleKind pins the conservation ledger's exact scope: a driver write
-// maps 1:1 to a wire item only for single-payload kinds, so the ledger's identity
-// sentWrites==ok_cached+err is exact for counter/stag/value (incl. the NaN/+Inf
-// rejected-value kinds) and EXCLUDES the big multi-value kinds (unique/value_p)
-// whose payloads the client splits into multiple items — making ok_cached (item
-// count) diverge from sentWrites (write-call count) unpredictably.
+// The ledger identity only holds where a write maps 1:1 to a wire item; clients split
+// unique/value_p payloads into several items, so those kinds are excluded.
 func TestLedgerEligibleKind(t *testing.T) {
 	eligible := []string{kindCounter, kindStag, kindValue, kindValueNaN, kindValueInf}
 	for _, k := range eligible {
@@ -256,18 +217,14 @@ func TestLedgerEligibleKind(t *testing.T) {
 	}
 }
 
-// TestLedgerWriteCounts pins sentWrites per ELIGIBLE metric — the true input
-// cardinality the ledger balances against — straight from stream.Writes, with the
-// multi-value kinds (unique/value_p) filtered OUT (seeds are NOT in Writes either,
-// so cold-start metric-not-found accounting is excluded on both sides).
+// Seeds are not in Writes, so cold-start metric-not-found accounting is excluded on both sides.
 func TestLedgerWriteCounts(t *testing.T) {
 	stream := metricStream{
 		Writes: []metricWrite{
 			{Kind: kindCounter, Metric: "m1"}, {Kind: kindCounter, Metric: "m1"}, {Kind: kindCounter, Metric: "m1"},
 			{Kind: kindValue, Metric: "m2"}, {Kind: kindValue, Metric: "m2"},
 			{Kind: kindValueNaN, Metric: "rej"}, // a rejection metric's writes are counted too
-			// multi-value kinds are EXCLUDED — their item count ≠ write count, so they
-			// must not appear in the ledger's sentWrites (balanced elsewhere instead).
+			// multi-value kinds are excluded: item count != write count
 			{Kind: kindUnique, Metric: "u_split"}, {Kind: kindUnique, Metric: "u_split"},
 			{Kind: kindValueP, Metric: "vp_split"},
 		},
@@ -278,9 +235,6 @@ func TestLedgerWriteCounts(t *testing.T) {
 	}
 }
 
-// TestKnownMetricNames pins that the known set is the union of the normal metrics
-// and the rejection metrics — the set classifyIngestionSeries uses to pin a series
-// to its metric.
 func TestKnownMetricNames(t *testing.T) {
 	stream := metricStream{
 		Metrics: []metricModel{{Name: "m1"}, {Name: "m2"}},
@@ -295,10 +249,6 @@ func TestKnownMetricNames(t *testing.T) {
 	}
 }
 
-// TestLedgerConverged pins the per-metric balance predicate the ledger poll uses to
-// stop early: true only when EVERY metric has okCached+err == sentWrites. Both
-// undershoot (silent loss) and overshoot (double-counting) keep it false. Statuses
-// are keyed by ID; a warn does not help balance.
 func TestLedgerConverged(t *testing.T) {
 	want := map[string]int{"m1": 70}
 	cases := []struct {
@@ -321,9 +271,7 @@ func TestLedgerConverged(t *testing.T) {
 	}
 }
 
-// TestRejectionsConverged pins that Sent==false rejections are unconstrained (a
-// client-side drop has no server status to wait for) while Sent==true ones must
-// reach their exact status count (matched by ID).
+// A Sent==false rejection is a client-side drop with no server status to wait for.
 func TestRejectionsConverged(t *testing.T) {
 	rejections := []rejectionMetric{
 		{Name: "r_sent", StatusID: statusIDZeroCounter, Writes: 5, Sent: true},
@@ -341,13 +289,8 @@ func TestRejectionsConverged(t *testing.T) {
 	}
 }
 
-// TestAddRejectionsPerClient pins the per-client rejection generation (the
-// client-side-rejection analysis). All three clients get the two VALUE rejections
-// (NaN → 23, +Inf → 61), Sent==true with Writes==numBuckets. cpp additionally SENDS
-// the two COUNTER rejections (zero → 62, negative → 25), Sent==true with Writes==
-// numBuckets. go/rust instead record those two counter cases as Sent==false
-// (Writes==0, SkipReason set, no wire writes): their clients drop count<=0 before the
-// wire, so the case is documented as a SKIP rather than generated as a real write.
+// go and rust drop count<=0 before the wire, so their zero/negative counter rejections
+// are recorded as skips (Sent==false, no writes); cpp sends them.
 func TestAddRejectionsPerClient(t *testing.T) {
 	cases := []struct {
 		clientTag  string
@@ -416,7 +359,7 @@ func TestAddRejectionsPerClient(t *testing.T) {
 			if r.Writes != tc.wantWrites[i] {
 				t.Errorf("%s rejection[%d] %q: Writes = %d, want %d", tc.clientTag, i, r.Name, r.Writes, tc.wantWrites[i])
 			}
-			// Sent==false must carry a documented SkipReason; Sent==true carries none.
+
 			if !r.Sent && r.SkipReason == "" {
 				t.Errorf("%s rejection[%d] %q: Sent=false but SkipReason is empty", tc.clientTag, i, r.Name)
 			}
@@ -425,7 +368,7 @@ func TestAddRejectionsPerClient(t *testing.T) {
 			}
 			wantWritesTotal += tc.wantWrites[i]
 		}
-		// Only Sent==true rejections append writes; SKIPs append none.
+
 		if len(b.writes) != wantWritesTotal {
 			t.Errorf("%s: builder writes = %d, want %d (only Sent==true rejections append writes)",
 				tc.clientTag, len(b.writes), wantWritesTotal)
@@ -433,12 +376,8 @@ func TestAddRejectionsPerClient(t *testing.T) {
 	}
 }
 
-// TestStreamSeedsIncludesRejections pins that the cold-start seed list covers the
-// Sent==true rejection metrics (each seeds with a VALID kind-matching write so
-// auto-create provisions the metric before the rejected writes arrive), that the
-// rejected value metrics seed as VALUE (seedKind) so auto-create derives a value
-// metric, and that a Sent==false rejection (a client-side drop) is NOT seeded — the
-// client never sends it, so seeding would orphan an empty metric.
+// Sent rejections are seeded so auto-create provisions them before the rejected writes;
+// a Sent==false one is not, since seeding would orphan an empty metric.
 func TestStreamSeedsIncludesRejections(t *testing.T) {
 	stream := metricStream{
 		Metrics: []metricModel{{Name: "m_counter", Kind: kindCounter}, {Name: "m_value", Kind: kindValue}},
@@ -449,7 +388,7 @@ func TestStreamSeedsIncludesRejections(t *testing.T) {
 		},
 	}
 	seeds, names := streamSeeds(stream)
-	// 2 normal metrics + 2 Sent==true rejections; the Sent==false one is NOT seeded.
+
 	if len(seeds) != 4 || len(names) != 4 {
 		t.Fatalf("streamSeeds: got %d seeds/%d names, want 4/4 (Sent==false rejection not seeded)", len(seeds), len(names))
 	}
@@ -475,7 +414,7 @@ func TestStreamSeedsIncludesRejections(t *testing.T) {
 			t.Errorf("name %q missing from names list %v", n, names)
 		}
 	}
-	// The skipped rejection must appear in NEITHER seeds nor names.
+
 	if gotNames["rej_skipped"] {
 		t.Errorf("Sent==false rejection rej_skipped was seeded (it must not be — the client never sends it): names=%v", names)
 	}

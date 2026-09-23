@@ -7,57 +7,34 @@ import (
 )
 
 // numBuckets is the number of consecutive 1-second buckets every series fills
-// (70 consecutive 1s buckets). Each series writes all 70, so the
-// expected model has a non-zero count for every bucket and a missing/null point
-// back from /api/query is unambiguously a failure — EXCEPT for the big-unique
-// stress metric, which populates a subset (see bigUniqueBuckets) for the wire/
-// memory budget; its asserter checks only the buckets it actually wrote.
+// (except big-unique), so a missing point from /api/query is a failure.
 const numBuckets = 70
 
-// bigUniqueBuckets is how many 1s buckets the ~100k-distinct unique metric
-// fills. 100k×70×3 clients ≈ 168 MB on the wire and through agent→agg→CH; a
-// subset keeps the run fast while still forcing the ChUnique thinning estimator
-// (>65536 distinct) every populated bucket. A documented, scoped deviation from
-// the "all 70 buckets" default (a deliberate choice, documented here rather than derived).
+// bigUniqueBuckets is how many buckets the ~100k-distinct unique metric fills;
+// all 70 would be ≈168 MB on the wire across three clients.
 const bigUniqueBuckets = 10
 
-// bigUniqueDistinct is the distinct-value count for the approximate-unique
-// case: >65536 forces ChUnique's power-of-2 thinning (the only path whose
-// ±2% band is meaningful); the 1σ relative error there is ≈0.45%, so ±2% is
-// ~4σ (very safe).
+// bigUniqueDistinct exceeds 65536 to force ChUnique's thinning estimator
+// (1σ ≈ 0.45%, so the ±2% band is ~4σ).
 const bigUniqueDistinct = 100000
 
-// smallUniqueDistinct is the exact-unique case distinct count (with each value
-// emitted twice to exercise within-bucket dedup). Well inside the 65536 exact
-// region → the asserter compares equality, not a band.
+// smallUniqueDistinct is the exact-unique distinct count, well inside
+// ChUnique's exact region.
 const smallUniqueDistinct = 300
 
-// valuePBucketPoints is the per-bucket sample count for value_p (a
-// few thousand points per bucket). Enough for the t-digest to place centroids
-// well, small enough to compile/run fast across all three clients.
+// valuePBucketPoints is the per-bucket value_p sample count: enough for the
+// t-digest to place centroids well, small enough to run fast.
 const valuePBucketPoints = 2000
 
-// fullKeyCap is the rendered full-key (metric name + tags) ceiling.
-// The generator keeps every key well under it; the assertion path logs the max
-// so a future generator change that blows the budget is visible. Stricter than
-// the clients' own caps (cpp 1024 B, rust 4096 B) so none silently drops a
-// series. NOTE: tag STRING values are also capped at MaxStringLen=128 by the
-// receiver (format.go); the stag generator stays under it.
+// fullKeyCap bounds the rendered full key (name + tags), below the clients'
+// own caps (cpp 1024 B, rust 4096 B) so none silently drops a series.
 const fullKeyCap = 768
 
-// Metric kinds the generator emits. kindCounter/kindValue/kindUnique auto-create
-// from a kind-matching seed (autocreate.go: counter default, unique if IsSetUnique,
-// value if IsSetValue). kindValueP NEVER auto-creates, so the harness pre-creates
-// it via POST /api/metric before the client runs (metric_create.go). kindStag is a
-// counter metric whose assertion is cardinality (qw=cardinality, no group-by).
-//
-// kindValueNaN/kindValueInf are REJECTED value payloads — a NaN and a
-// +Inf — every write of which the pipeline rejects. They auto-create as VALUE
-// metrics from a kind-matching (valid, value=1) seed, then the real writes are
-// rejected and asserted via __src_ingestion_status (status 23 / 61). They are
-// rendered by dedicated template branches because NaN/+Inf are not valid float
-// literals in any of the three driver languages (a plain {{printf "%v"}} would
-// emit "NaN"/"+Inf", which none of go/rust/cpp compile).
+// Metric kinds the generator emits. counter/value/unique auto-create from a
+// kind-matching seed; value_p is pre-created (metric_create.go); stag is a
+// counter asserted by cardinality. value_nan/value_inf are rejected payloads
+// with their own template branches, since neither is a float literal in any
+// driver language.
 const (
 	kindCounter  = "counter"
 	kindValue    = "value"
@@ -68,76 +45,42 @@ const (
 	kindValueInf = "value_inf" // rejected value payload: +Inf → status 61 err_too_big_value
 )
 
-// --- rejection cases + conservation ledger ------------------------
-//
-// __src_ingestion_status (builtin metric ID -11, internal/format/builtin_metrics:
-// BuiltinMetricMetaIngestionStatus) is the per-event accounting record the agent
-// writes for every metric observation: status=ok_cached (10) when accepted, or one
-// err_* status when rejected. Its tags are positional: tag1=metric (the referenced
-// metric NAME), tag2=status (rendered as the numeric VALUE ID via format.CodeTagValue
-// — e.g. " 10"=ok_cached, " 23"=err_nan_inf_value; the human name lives only in the
-// builtin's ValueComments and is NOT in the query reply), tag3=tag_id, tag4=component.
-// Grouping a query by tag1+tag2 (qb=1&qb=2) yields one series per (metric, status).
-//
-// Source-of-truth status values (internal/format/builtin_tags.go +
-// internal/format/format.go ValidateCounter/ValidateValue):
-//
-//	zero counter   → ValidateMetricData: counter==0 && no value/unique → 62 err_zero_counter
-//	negative count → ValidateCounter: f < 0                               → 25 err_negative_counter
-//	NaN value      → ValidateValue: IsNaN                                  → 23 err_nan_inf_value
-//	+Inf value     → ValidateValue: +Inf > MaxFloat32                      → 61 err_too_big_value
-//
-// NOTE: a +Inf VALUE yields status 61 (err_too_big_value), not 24 as an earlier
-// doc claimed. Status 24 (err_nan_inf_COUNTER) only fires for a NaN COUNTER via
-// ValidateCounter — a case no matrix input exercises. The harness asserts the
-// source-true status 61; this comment records that deviation.
+// __src_ingestion_status is the agent's per-observation accounting record:
+// ok_cached (10) when accepted, one err_* status when rejected. Tags are
+// tag1=metric name, tag2=status rendered as its numeric ID (e.g. " 23"), so
+// grouping by qb=1&qb=2 yields one series per (metric, status). A +Inf value
+// fails ValidateValue as too big (61), not as NaN/Inf (24 is counters only).
 const (
 	ingestionStatusMetric = "__src_ingestion_status"
 
-	// statusName* are the human DISPLAY names for the __src_ingestion_status tag2
-	// value IDs (mirroring the builtin's ValueComments in internal/format). The query
-	// API does NOT render these names — it renders the numeric ID (CodeTagValue, e.g.
-	// " 23") — so the assertions work in numeric IDs throughout (classifyIngestionSeries
-	// parses the ID, matched against rejectionMetric.StatusID); these name constants
-	// exist only to label PASS/FAIL lines readably. Classification: ok_cached =
-	// accepted, err_* = rejected (a loss), warn_* = warning (accepted, NOT a loss).
+	// statusName* only label PASS/FAIL lines; assertions match statusID*.
 	statusNameOKCached    = "ok_cached"
 	statusNameZeroCounter = "err_zero_counter"     // 62
 	statusNameNegCounter  = "err_negative_counter" // 25
 	statusNameNanInfValue = "err_nan_inf_value"    // 23
-	statusNameTooBigValue = "err_too_big_value"    // 61 (NOT 24 — see note above)
+	statusNameTooBigValue = "err_too_big_value"    // 61
 
-	// statusID* mirror the numeric IDs the query API renders (CodeTagValue); the
-	// assertions key off these IDs (what the API actually returns), not the names.
+	// statusID* are the numeric IDs the query API renders (CodeTagValue).
 	statusIDZeroCounter = 62
 	statusIDNegCounter  = 25
 	statusIDNanInfValue = 23
 	statusIDTooBigValue = 61
 
-	// clientTag* are the per-client metric-name prefixes / --client selectors,
-	// matching the tags in clientDrivers (main.go). addRejections branches on them
-	// to model client-side rejection behavior (go/rust drop non-positive counts;
-	// cpp sends them).
+	// clientTag* are the per-client metric-name prefixes and --client selectors.
 	goClientTag   = "go"
 	rustClientTag = "rust"
 	cppClientTag  = "cpp"
 )
 
-// tag is one positional StatsHouse tag: Key is the tag index ("0".."47"), Val its
-// value. The go client's NamedTags ([2]string pairs) and the receiver both treat
-// the key verbatim, so positional keys round-trip without a metric mapping.
+// tag is one positional tag: Key is the index ("0".."47"), which round-trips
+// without a metric mapping.
 type tag struct {
 	Key string
 	Val string
 }
 
-// metricWrite is one observation injected into a client driver template. Kind
-// selects how the driver renders it (write_count / write_values / write_uniques,
-// or a deterministic loop for the large value_p/unique payloads). Tags is the
-// RAW tag set — empty values are kept here on purpose so the template emits
-// them and the client's own empty-value handling is exercised; the expected
-// model applies the same normalization. Count is always > 0 for counter/stag
-// (zero/negative inputs are rejected).
+// metricWrite is one observation injected into a client driver template. Tags
+// keep empty values so the client's own empty-tag handling is exercised.
 type metricWrite struct {
 	Kind    string
 	Metric  string
@@ -149,40 +92,26 @@ type metricWrite struct {
 	Gen     *genSpec  // value_p / unique loop descriptor; nil → literal payload
 }
 
-// genSpec describes a deterministic generator loop the driver emits in-place
-// (keeping the rendered source small for multi-thousand-point payloads) and the
-// harness replicates byte-for-byte to build the expected model. The "pinned
-// seed" principle is preserved: a deterministic formula is pinned, not a
-// per-language RNG. Kind is one of genValueUniform/genValueSkewed/
-// genUniqueDistinct/genUniqueDedup; N is the item count.
+// genSpec describes a deterministic generator loop the driver emits in place
+// and the harness replicates to build the expected model; N is the item count.
 type genSpec struct {
 	Kind string
 	N    int
 }
 
-// genKind* are the genSpec.Kind discriminator strings (the STRING VALUES the
-// driver templates match on with {{if eq .Gen.Kind "valueUniform"}}, so do not
-// change them). They are named genKind* (not genValueUniform etc.) to avoid
-// colliding with the generator FUNCTIONS of those names in quantile.go, which
-// the harness calls directly (expectedValues/expectedUnique). The harness and
-// every driver template render the EXACT same formula for each — see quantile.go
-// for the Go reference and drivers/{go,rust,cpp}/main.*.tmpl for the loop bodies.
+// genKind* are the genSpec.Kind strings the driver templates match on; do not
+// change them. quantile.go holds the Go reference of each formula.
 const (
-	genKindValueUniform   = "valueUniform"   // 0..N-1 (sorted; spec "0–999 step 1")
+	genKindValueUniform   = "valueUniform"   // 0..N-1
 	genKindValueSkewed    = "valueSkewed"    // shared-LCG r²/1000, mass near 0
 	genKindUniqueDistinct = "uniqueDistinct" // 1..N, distinct=N
 	genKindUniqueDedup    = "uniqueDedup"    // 1..N each emitted twice, distinct=N
 )
 
-// seriesModel is one (metric, normalized-tag-set) series in the expected model.
-// Tags is normalized exactly as the wire sees it: empty-valued tags dropped, the
-// client's _h host tag excluded (it is added by the client, not generated). Only
-// the map matching the metric's kind is populated; the asserter reads the right
-// one. Each map is keyed by absolute bucket timestamp and fully populated for
-// every bucket the series wrote (numBuckets, or bigUniqueBuckets for the stress
-// case). GenKind records the generator for loop-payload series (empty for
-// literal payloads) — the percentile asserter widens its band for the skewed
-// generator, whose inverse CDF amplifies quantile-space error into value space.
+// seriesModel is one expected series. Tags are normalized as the wire sees
+// them (empty values dropped); only the map for the metric's kind is set, keyed
+// by bucket timestamp. GenKind lets the percentile asserter widen its band for
+// the skewed generator.
 type seriesModel struct {
 	Tags    []tag
 	Counts  map[uint32]float64   // counter / stag: expected count
@@ -191,11 +120,8 @@ type seriesModel struct {
 	GenKind string               // genSpec.Kind for generator series; "" for literal
 }
 
-// metricModel is the expected model for one metric: Kind drives the asserter
-// (count / sum-min-max-avg / percentile / unique / cardinality); QBKeys are the
-// positional tag keys the harness groups by when querying it back (qb=…; empty
-// for stag, which queries cardinality with no group-by); Series are the expected
-// per-tag-set series.
+// metricModel is the expected model for one metric; QBKeys are the tag keys
+// the query groups by (empty for stag).
 type metricModel struct {
 	Name   string
 	Kind   string
@@ -203,12 +129,9 @@ type metricModel struct {
 	Series []seriesModel
 }
 
-// metricStream is the single generated stream: Base anchors the buckets, Writes
-// is injected into every client driver (the "pinned seed"), Metrics is the
-// shared expected model the VISIBLE assertions compare against, and Rejections
-// are the rejection-case metrics — every write rejected by the
-// pipeline, asserted via __src_ingestion_status + the conservation ledger, never
-// via visible output (so they stay out of Metrics and thus out of assertStream).
+// metricStream is the generated stream: Writes go to the driver, Metrics is
+// the visible expected model, and Rejections are asserted only through
+// __src_ingestion_status and the conservation ledger.
 type metricStream struct {
 	Base       uint32
 	Writes     []metricWrite
@@ -216,17 +139,9 @@ type metricStream struct {
 	Rejections []rejectionMetric
 }
 
-// rejectionMetric is one metric whose every write the pipeline REJECTS (Sent==true),
-// or — for go/rust's counter cases — every write the CLIENT drops before the wire
-// (Sent==false). It has no visible output either way. A Sent==true rejection is
-// asserted two ways: (1) the exact __src_ingestion_status status (StatusName) appears
-// with count == Writes, and (2) the conservation ledger balances for it
-// (sentWrites == 0 ok_cached + Writes rejected). Sent==false marks a case the client
-// drops CLIENT-SIDE — the go client only sends a counter when countToSend > 0
-// (client_bucket.go) and rust rejects count <= 0 inside write_count (lib.rs), so a
-// zero/negative count never reaches the agent and no server status is recorded: the
-// case has no writes (Writes==0) and is asserted as an explicit SKIP (assertRejections
-// prints SkipReason), documenting the drop rather than letting it pass silently.
+// rejectionMetric is one metric whose every write the pipeline rejects
+// (Sent==true: expected status count == Writes, ledger balances), or that the
+// client drops before the wire (Sent==false: reported as a SKIP).
 type rejectionMetric struct {
 	Name       string // e2e_<runID>_<client>_c_zero, …
 	Kind       string // kindCounter / kindValueNaN / kindValueInf (driver render + seed kind)
@@ -237,25 +152,10 @@ type rejectionMetric struct {
 	SkipReason string // documented reason when Sent==false
 }
 
-// generateStream builds the full metric stream once. The same Writes slice is
-// rendered into the driver template, and Metrics is derived from the same
-// construction, so there is exactly one source of truth (no per-language RNG).
-//
-// runID prefixes every metric name for isolation; clientTag ("go"/"rust"/"cpp")
-// is folded into the prefix too, so the three clients — all driven against the
-// same single agent/stack in one run — write disjoint metric names and their
-// per-bucket values cannot collide (a shared name would merge every client's
-// data and break the exact-match assertions). now is passed in (not read inside)
-// so Base is deterministic for a given invocation.
-//
-// The runID is SANITIZED for the metric name (hyphens → underscores): the
-// default runID is a datetime "20060102-150405" and resource names
-// (e2e-<runID>-clickhouse …) keep the hyphens, but a StatsHouse metric name
-// must match validMetricName — ASCII letters, digits, and '_' only (format.go).
-// The auto-create path tolerates a hyphen (so the counter metrics
-// happened to work), but POST /api/metric (the value_p pre-create path)
-// runs RestoreCachedInfo → ValidMetricName and rejects it. Sanitizing the prefix
-// makes every metric name valid for BOTH paths.
+// generateStream builds the writes and the expected model in one pass. The
+// runID and clientTag prefix every metric name, so clients sharing one stack
+// never collide; hyphens become underscores because POST /api/metric rejects
+// them in metric names.
 func generateStream(runID, clientTag string, now time.Time) metricStream {
 	prefix := "e2e_" + strings.ReplaceAll(runID, "-", "_") + "_" + clientTag + "_"
 	base := uint32(now.Unix()) - 120 // floor(now) − 120s (now is already second-granular)
@@ -320,9 +220,8 @@ func (b *streamBuilder) addCounterMetric(suffix, kind string, qb []string, serie
 	b.metrics = append(b.metrics, m)
 }
 
-// addCounters builds the counter subset: the original six counter
-// metrics (kept as-is) plus a formal tag-matrix metric that systematically
-// covers 0–6 tags, value pools, unicode, and an empty tag value.
+// addCounters builds the counter metrics, including a tag matrix covering 1–6
+// tags, a value pool, unicode and an empty tag value.
 func (b *streamBuilder) addCounters() {
 	b.addCounterMetric("c_ones", kindCounter, nil, []counterSeriesSpec{
 		{tags: nil, count: func(int) float64 { return 1 }}, // no tags, count 1
@@ -331,41 +230,28 @@ func (b *streamBuilder) addCounters() {
 		{tags: []tag{{"0", "alpha"}, {"1", "beta"}}, count: func(int) float64 { return 1 }},
 	})
 	b.addCounterMetric("c_multi", kindCounter, nil, []counterSeriesSpec{
-		// Four series over tag keys {0,1} with small value pools → exercises the
-		// API group-by splitting one metric into several series (qb=0&qb=1).
+		// Four series over tag keys {0,1} exercise group-by splitting.
 		{tags: []tag{{"0", "x"}, {"1", "p"}}, count: off(2)},
 		{tags: []tag{{"0", "x"}, {"1", "q"}}, count: off(10)},
 		{tags: []tag{{"0", "y"}, {"1", "p"}}, count: off(20)},
 		{tags: []tag{{"0", "y"}, {"1", "q"}}, count: off(30)},
 	})
 	b.addCounterMetric("c_empty", kindCounter, nil, []counterSeriesSpec{
-		// Tag 1 has an empty value: the client drops it, so the series arrives as
-		// {0:"val"}; the expected model normalizes the same way.
+		// The client drops the empty tag 1, so the series arrives as {0:"val"}.
 		{tags: []tag{{"0", "val"}, {"1", ""}}, count: func(int) float64 { return 3 }},
 	})
 	b.addCounterMetric("c_unicode", kindCounter, nil, []counterSeriesSpec{
-		// Unicode tag values round-trip as UTF-8; per-bucket alternation 1/>1.
+		// Unicode tag values round-trip as UTF-8.
 		{tags: []tag{{"0", "東京"}, {"1", "café"}}, count: alt(1, 5)},
 	})
 	b.addCounterMetric("c_many", kindCounter, nil, []counterSeriesSpec{
-		// Six tags (the spec's 0–6 range maxed out) so auto-create provisions a
-		// mapping with enough tag slots and qb covers indices 0..5.
+		// Six tags, so qb covers indices 0..5.
 		{tags: []tag{{"0", "a"}, {"1", "b"}, {"2", "c"}, {"3", "d"}, {"4", "e"}, {"5", "f"}}, count: alt(1, 7)},
 	})
 	b.addCounterMetric("c_matrix", kindCounter, nil, []counterSeriesSpec{
-		// Formal tag matrix: tag-set cardinality 1..6, a value pool of
-		// two at index 0, a unicode pair, and an empty tag value. Each series
-		// carries a distinct per-bucket count so a group-by error can't stay
-		// hidden; group-by covers indices 0..5 (fewer-tag series surface with
-		// their higher tags empty-dropped, so signatures stay distinct).
-		//
-		// Cardinality 0 (a tagless series) is covered by c_ones, NOT here: a
-		// tagless series mixed with tagged series in ONE metric, asserted under
-		// group-by, is silently dropped by the api's series resolution (the
-		// all-empty-stag group is omitted when the metric's user tags are
-		// unmapped — the auto-create steady state — even though the rows are
-		// stored correctly in ClickHouse). That is an upstream api quirk, not
-		// harness behavior, so the matrix exercises cardinalities 1..6 only.
+		// Each series has a distinct count so a group-by error cannot hide. A
+		// tagless series is covered by c_ones instead: mixed with tagged series
+		// under group-by, the API drops it when the metric's tags are unmapped.
 		{tags: []tag{{"0", "m0"}}, count: off(110)},
 		{tags: []tag{{"0", "m0"}, {"1", "m1"}}, count: off(120)},
 		{tags: []tag{{"0", "m0"}, {"1", "m1"}, {"2", "m2"}}, count: off(130)},
@@ -379,13 +265,9 @@ func (b *streamBuilder) addCounters() {
 	})
 }
 
-// seedKind returns the wire-write kind a driver must use to SEED this metric
-// during cold-start pre-warm so auto-create derives the right metric kind
-// (value/unique auto-create only from a kind-matching seed). value_p is
-// pre-created, so its seed kind is harmless; value matches its kind. The rejected
-// value kinds (value_nan/value_inf) seed as a plain VALUE so auto-create derives
-// a value metric — the seed itself is a valid value=1 write (the real, rejected
-// writes come after pre-warm).
+// seedKind returns the write kind that seeds a metric during pre-warm so
+// auto-create derives the right metric kind; rejected value kinds seed with a
+// valid value=1 write.
 func seedKind(kind string) string {
 	switch kind {
 	case kindValue, kindValueP, kindValueNaN, kindValueInf:
@@ -397,25 +279,16 @@ func seedKind(kind string) string {
 	}
 }
 
-// seedDef is one metric's cold-start seed: the name and the wire-write KIND the
-// driver must use so auto-create derives the right metric kind. It is injected
-// into the driver templates alongside the metric-name list (the pre-warm poll
-// needs only names; the seed DISPATCH needs the kind).
+// seedDef is one metric's cold-start seed name and write kind.
 type seedDef struct {
 	Name string
 	Kind string
 }
 
-// streamSeeds returns the per-metric seeds and the parallel name list the driver
-// templates consume. value/unique metrics seed with a kind-matching write so
-// auto-create derives value/unique (not the counter default); value_p is
-// pre-created by the harness so its seed (a value write) maps cleanly. A Sent==true
-// rejection seeds with a VALID kind-matching write (count=1 / value=1) so auto-create
-// provisions the metric; the seed itself is dropped on arrival (unmapped → status
-// metric_not_found in __src_ingestion_status_no_shard, NOT in this metric's
-// ledger), and the real rejected writes follow after pre-warm. A Sent==false
-// rejection (go/rust counter drop) is NOT seeded: the client never sends it, so a
-// seed would only orphan an empty metric with no writes to follow.
+// streamSeeds returns the seeds and the parallel name list the driver templates
+// consume. A rejection's seed is a valid write that provisions the metric; it
+// lands in __src_ingestion_status_no_shard, outside the metric's ledger.
+// Client-dropped rejections are not seeded.
 func streamSeeds(stream metricStream) (seeds []seedDef, names []string) {
 	seeds = make([]seedDef, 0, len(stream.Metrics)+len(stream.Rejections))
 	names = make([]string, 0, len(stream.Metrics)+len(stream.Rejections))
@@ -425,7 +298,7 @@ func streamSeeds(stream metricStream) (seeds []seedDef, names []string) {
 	}
 	for _, r := range stream.Rejections {
 		if !r.Sent {
-			continue // client drops client-side before the wire; no real writes follow → no seed
+			continue
 		}
 		seeds = append(seeds, seedDef{Name: r.Name, Kind: seedKind(r.Kind)})
 		names = append(names, r.Name)
@@ -433,16 +306,12 @@ func streamSeeds(stream metricStream) (seeds []seedDef, names []string) {
 	return seeds, names
 }
 
-// off returns a per-bucket count function: baseN+bucket (baseN ≥ 2 → always > 1,
-// distinct per bucket). Used for the multi-series metrics so group-by
-// correctness is verifiable bucket by bucket.
+// off returns a per-bucket count baseN+bucket, distinct per bucket.
 func off(baseN int) func(int) float64 {
 	return func(bucket int) float64 { return float64(baseN + bucket) }
 }
 
-// alt returns a per-bucket count alternating between evenC (even buckets) and
-// oddC (odd buckets), so a single series carries both count == 1 and count > 1
-// across the buckets.
+// alt returns a per-bucket count alternating between evenC and oddC.
 func alt(evenC, oddC float64) func(int) float64 {
 	return func(bucket int) float64 {
 		if bucket%2 == 0 {
@@ -452,11 +321,7 @@ func alt(evenC, oddC float64) func(int) float64 {
 	}
 }
 
-// normalizeTags drops empty-valued tags, mirroring the go client's fillTag drop
-// (client_packet.go) and the receiver-side normalization (receiver.go). The _h
-// host tag is never generated, so it is not stripped here; assertions strip it
-// from the API response separately. Order is preserved for stable
-// rendering/debugging.
+// normalizeTags drops empty-valued tags as the client and receiver do.
 func normalizeTags(raw []tag) []tag {
 	var out []tag
 	for _, t := range raw {
@@ -468,9 +333,7 @@ func normalizeTags(raw []tag) []tag {
 	return out
 }
 
-// fullKeyLen estimates the rendered full key length (metric name + tag keys +
-// values) for the cap check. It is an upper bound (ignores TL framing),
-// which is what matters for the drop thresholds.
+// fullKeyLen estimates the rendered full key length for the cap check.
 func fullKeyLen(metric string, tags []tag) int {
 	n := len(metric)
 	for _, t := range tags {
@@ -478,6 +341,3 @@ func fullKeyLen(metric string, tags []tag) int {
 	}
 	return n
 }
-
-// (sortedKeys now lives in conformance.go as a generic over map[string]V,
-// covering this file's map[string]bool uses)

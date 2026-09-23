@@ -8,54 +8,31 @@ import (
 	"text/template"
 )
 
-// This file implements the rust-client path: acquire the pinned source,
-// render the generated stream into a harness-owned driver, build it offline in a
-// pinned rust container (rlib + rustc --extern), and run it over TCP to the agent.
-//
-// BUILD RECIPE (deviation from the literal "cargo build then rustc --extern",
-// documented with evidence — see buildAndRunRustClient): the statshouse crate is
-// zero-dependency and single-file, so the rlib is produced with a direct
-// `rustc --crate-type rlib` against the pinned lib.rs, then the driver is compiled
-// with the spec's `rustc --extern statshouse=<rlib>`. Cargo's offline workspace
-// resolution fails here because the workspace's `xtask` member pulls crates.io
-// deps (lexopt/xshell) the offline container cannot satisfy; direct rustc compiles
-// the identical source with no deps, fully offline.
+// The rust-client path. The statshouse crate is a zero-dependency single file,
+// so it is built with plain `rustc --crate-type rlib` and the driver with
+// `rustc --extern`: offline cargo fails because the workspace's xtask member
+// pulls crates.io deps the container cannot fetch.
 
 const (
-	// rustBaseImage is the pinned Rust toolchain the driver builds+runs in.
-	// Multi-arch; apple/container selects arm64, matching the cross-compiled
-	// daemons. Pinned to an exact minor (not floating rust:1) so a rerun reproduces
-	// the same toolchain (pinned base image).
+	// rustBaseImage is pinned to an exact minor so reruns get the same toolchain.
 	rustBaseImage = "rust:1.83-bookworm"
 
-	rustClientName  = "statshouse-rs" // the active client in e2e/clients.txt
-	driverRustDir   = "drivers/rust"  // driver template dir, relative to e2e/
+	rustClientName  = "statshouse-rs"
+	driverRustDir   = "drivers/rust"
 	rustLibRel      = "statshouse/src/lib.rs"
-	rustTargetMount = "/target" // host-mounted rlib cache (rw)
+	rustTargetMount = "/target" // host-mounted rlib cache
 )
 
-// rustByteStringLit renders a Go string as the BODY of a Rust byte-string literal.
-// Rust byte strings cannot hold raw non-ASCII bytes (a UTF-8 é in b"…" is a compile
-// error), so every non-ASCII byte is emitted as a 2-digit \xHH escape (Rust's \x in
-// byte strings requires exactly two hex digits and is NOT greedy, so \xc3\xa9 is
-// unambiguous); " and \ are \" and \\; printable ASCII (0x20..0x7e) passes through.
-// The shared escapeLitBody does the work; only the non-ASCII format is Rust-specific.
-// Pure → unit-tested (TestRustByteStringLit).
+// rustByteStringLit renders the body of a Rust byte-string literal. Byte
+// strings cannot hold raw non-ASCII bytes, so those become \xHH escapes.
 func rustByteStringLit(s string) string {
 	return escapeLitBody(s, `\x%02x`)
 }
 
-// rustFloatLit renders a float64 as a Rust f64 literal. A bare integer literal is
-// typed i32 by default and won't satisfy write_count's f64 parameter, so floatLit
-// appends ".0" when the rendered form has no decimal point or exponent.
-// Pure → unit-tested (TestRustFloatLit).
 func rustFloatLit(f float64) string {
 	return floatLit(f)
 }
 
-// rustDriverFuncs binds the rust escapers for the rust driver template. Shared by
-// renderRustDriver (disk write) and the clientDriver.renderSource closure (pure
-// re-render for the --skip-client-build cache hash).
 func rustDriverFuncs() template.FuncMap {
 	return template.FuncMap{
 		"rustBytes": rustByteStringLit,
@@ -63,19 +40,14 @@ func rustDriverFuncs() template.FuncMap {
 	}
 }
 
-// renderRustDriver renders the metric stream into <outDir>/main.rs via the rust
-// driver template, binding the rustBytes/rustFloat escapers. See renderDriver for
-// the shared parse/execute contract.
 func renderRustDriver(tmplPath string, stream metricStream, outDir string) error {
 	return renderDriver(tmplPath, "rust-driver", rustDriverFuncs(), stream, outDir, "main.rs")
 }
 
-// buildAndRunRustClient is the full rust path: clone → render → offline
-// container build (rlib + rustc --extern) → foreground run. Returns the driver
-// process exit code, combined stdout+stderr, and a launch error (nil for a clean
-// non-zero exit).
+// buildAndRunRustClient clones, renders, builds offline and runs the rust
+// driver. A non-zero driver exit is reported via the exit code, not err.
 func buildAndRunRustClient(ctx context.Context, rt Runtime, rec *recorder, o clientRunOpts) (int, string, error) {
-	// --skip-client-build: run the cached driver binary without clone+render+build.
+	// --skip-client-build: run the cached binary.
 	if o.skipBuild {
 		return runCachedDriver(ctx, rt, rec, o, rustBaseImage)
 	}
@@ -91,9 +63,7 @@ func buildAndRunRustClient(ctx context.Context, rt Runtime, rec *recorder, o cli
 	}
 	rec.logf("rendered rust driver: %s (%d writes)", filepath.Join(o.workDir, "main.rs"), len(o.stream.Writes))
 
-	// Host-mounted rlib cache so the (sub-second) rlib build is skipped on a re-run
-	// whose pinned source is unchanged. buildCache holds the cached driver binary
-	// for --skip-client-build (a host bind mount needs the dir to exist first).
+	// Bind-mount sources must exist before the run.
 	targetCache := filepath.Join(o.cache, "rust-target")
 	for _, d := range []string{targetCache, o.buildCache} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
@@ -125,7 +95,7 @@ func buildAndRunRustClient(ctx context.Context, rt Runtime, rec *recorder, o cli
 			o.workDir + ":" + workMount,
 			clonePath + ":" + clientMount + ":ro",
 			targetCache + ":" + rustTargetMount,
-			o.buildCache + ":" + driverBinMount, // build output → cached driver binary (--skip-client-build)
+			o.buildCache + ":" + driverBinMount,
 		},
 		Cmd:    []string{"/bin/sh", "-c", buildRun},
 		AutoRm: true,

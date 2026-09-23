@@ -8,9 +8,7 @@ import (
 	"testing"
 )
 
-// decodeRustBytes is a minimal interpreter of the byte-string-literal body form
-// rustByteStringLit emits (\", \\, and \xHH only). It exists solely so the
-// escaper's tests can prove the rendered form round-trips to the original bytes.
+// decodeRustBytes decodes only the forms rustByteStringLit emits (\", \\, \xHH).
 func decodeRustBytes(s string) string {
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {
@@ -33,8 +31,7 @@ func decodeRustBytes(s string) string {
 	return b.String()
 }
 
-// decodeCString is a minimal interpreter of the C-string-literal body form
-// cStringLit emits (\", \\, and \NNN 3-digit octal only), for the escaper tests.
+// decodeCString decodes only the forms cStringLit emits (\", \\, 3-digit \NNN).
 func decodeCString(s string) string {
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {
@@ -49,7 +46,7 @@ func decodeCString(s string) string {
 		case '\\':
 			b.WriteByte('\\')
 		default:
-			// cStringLit always emits exactly 3 octal digits for a non-printable.
+			// cStringLit always emits exactly 3 octal digits.
 			if i+2 < len(s) {
 				if n, err := strconv.ParseUint(s[i:i+3], 8, 16); err == nil {
 					b.WriteByte(byte(n))
@@ -63,9 +60,8 @@ func decodeCString(s string) string {
 	return b.String()
 }
 
-// TestRustByteStringLit checks the rust byte-string escaper round-trips every
-// byte value and renders the documented exact forms. The \xHH form is mandatory
-// because a raw non-ASCII byte in b"…" is a Rust compile error.
+// TestRustByteStringLit: \xHH is mandatory because a raw non-ASCII byte in b"…"
+// is a Rust compile error.
 func TestRustByteStringLit(t *testing.T) {
 	t.Run("exact forms", func(t *testing.T) {
 		cases := map[string]string{
@@ -82,9 +78,6 @@ func TestRustByteStringLit(t *testing.T) {
 		}
 	})
 
-	// Every byte 0..255 must survive a render→decode round-trip. This is the
-	// property that actually matters: no input can produce a literal whose
-	// interpretation differs from the input.
 	t.Run("round-trip all bytes", func(t *testing.T) {
 		for v := 0; v < 256; v++ {
 			in := string([]byte{byte(v)})
@@ -95,9 +88,8 @@ func TestRustByteStringLit(t *testing.T) {
 	})
 }
 
-// TestRustFloatLit pins that the rendered literal always has a decimal point or
-// exponent so Rust types it f64 (a bare integer is i32 by default and won't bind
-// to write_count's f64 parameter).
+// TestRustFloatLit: a bare integer literal is i32 in Rust and won't bind to
+// write_count's f64 parameter.
 func TestRustFloatLit(t *testing.T) {
 	cases := map[float64]string{
 		1:    "1.0",
@@ -118,10 +110,8 @@ func TestRustFloatLit(t *testing.T) {
 	}
 }
 
-// TestCFloatLit mirrors TestRustFloatLit for the cpp driver: the rendered literal
-// preserves FULL precision (the prior {{printf "%.1f" .Count}} truncated future
-// fractional counts to one decimal place) and always carries a decimal point so a
-// whole number renders as a double literal.
+// TestCFloatLit: full precision, and always a decimal point so a whole number
+// is a double literal.
 func TestCFloatLit(t *testing.T) {
 	cases := map[float64]string{
 		1:       "1.0",
@@ -144,10 +134,8 @@ func TestCFloatLit(t *testing.T) {
 	}
 }
 
-// TestCStringLit checks the C/C++ string escaper round-trips every byte value,
-// renders the documented exact forms, and — critically — keeps octal escapes a
-// fixed width 3 so a following octal digit char is not swallowed (C's \x is
-// greedy over all hex digits; octal stops at 3, which is why octal is used).
+// TestCStringLit: octal escapes are fixed width 3 so a following digit is not
+// swallowed (C's \x is greedy over all hex digits; octal stops at 3).
 func TestCStringLit(t *testing.T) {
 	t.Run("exact forms", func(t *testing.T) {
 		cases := map[string]string{
@@ -164,9 +152,6 @@ func TestCStringLit(t *testing.T) {
 		}
 	})
 
-	// A non-printable byte whose octal form is followed (in the literal) by an
-	// octal-digit char must still decode to two bytes: \003 then '3', not \033.
-	// This is the greedy-octal safety property; 3-digit width guarantees it.
 	t.Run("non-greedy octal", func(t *testing.T) {
 		in := string([]byte{0x03, '3'}) // ETX then '3'
 		enc := cStringLit(in)           // want "\0033"
@@ -188,11 +173,8 @@ func TestCStringLit(t *testing.T) {
 	})
 }
 
-// TestRenderRustDriverQuoting drives the rust driver template with a metric/tag
-// value carrying a quote, backslash, and UTF-8, then asserts the rendered source
-// carries the \xHH-escaped bytes and NO raw non-ASCII (which would be a compile
-// error in a Rust byte string). The escaper is what stands between an injected
-// value and a broken build.
+// TestRenderRustDriverQuoting: a quote/backslash/UTF-8 value must reach the
+// rendered template escaped, with no raw non-ASCII.
 func TestRenderRustDriverQuoting(t *testing.T) {
 	root, err := repoRoot()
 	if err != nil {
@@ -222,10 +204,8 @@ func TestRenderRustDriverQuoting(t *testing.T) {
 	}
 }
 
-// TestRenderCppDriverQuoting is the cpp analogue: the rendered source must carry
-// the octal-escaped bytes and no raw non-ASCII. (A raw UTF-8 byte is technically
-// valid in a C++ literal, but the escaper's contract is to escape it, so a raw
-// byte here means the escape path was bypassed.)
+// TestRenderCppDriverQuoting: raw UTF-8 is valid in C++, but here it would
+// mean the escape path was bypassed.
 func TestRenderCppDriverQuoting(t *testing.T) {
 	root, err := repoRoot()
 	if err != nil {
