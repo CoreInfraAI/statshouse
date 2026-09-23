@@ -7,9 +7,16 @@ import (
 )
 
 // dockerRuntime shells out to docker (default on Linux).
-type dockerRuntime struct{}
+type dockerRuntime struct{ cliRuntime }
 
-func (r *dockerRuntime) Name() string { return "docker" }
+func newDockerRuntime() *dockerRuntime {
+	return &dockerRuntime{cliRuntime{
+		bin:             "docker",
+		networkLsArgs:   []string{"network", "ls", "--format", "{{.Name}}"},
+		containerLsArgs: []string{"ps", "--all", "--format", "{{.Names}}"},
+		parseContainers: func(out string) ([]string, error) { return splitNonEmpty(out), nil },
+	}}
+}
 
 func (r *dockerRuntime) HasNetworkEgress() bool { return true }
 
@@ -22,78 +29,6 @@ func (r *dockerRuntime) EnsureSystem(ctx context.Context) error {
 
 func (r *dockerRuntime) CheckVersion(_ context.Context) error {
 	return nil
-}
-
-func (r *dockerRuntime) NetworkCreate(ctx context.Context, name string) error {
-	_, err := runOK(ctx, "docker", "network", "create", name)
-	return err
-}
-
-func (r *dockerRuntime) NetworkRemove(ctx context.Context, name string) error {
-	present, err := resourceInList(ctx, r.NetworkList, name)
-	if err != nil {
-		return err
-	}
-	if !present {
-		return nil // already gone — idempotent
-	}
-	_, err = runOK(ctx, "docker", "network", "rm", name)
-	return err
-}
-
-func (r *dockerRuntime) NetworkList(ctx context.Context) ([]string, error) {
-	out, err := runOK(ctx, "docker", "network", "ls", "--format", "{{.Name}}")
-	if err != nil {
-		return nil, err
-	}
-	return splitNonEmpty(out), nil
-}
-
-func (r *dockerRuntime) ContainerList(ctx context.Context) ([]string, error) {
-	out, err := runOK(ctx, "docker", "ps", "--all", "--format", "{{.Names}}")
-	if err != nil {
-		return nil, err
-	}
-	return splitNonEmpty(out), nil
-}
-
-func (r *dockerRuntime) Run(ctx context.Context, opts RunOpts) error {
-	_, err := runOK(ctx, "docker", buildRunArgs(opts)...)
-	return err
-}
-
-func (r *dockerRuntime) Exec(ctx context.Context, id string, cmd []string) (string, int, error) {
-	args := append([]string{"exec", id}, cmd...)
-	res, err := run(ctx, "docker", args...)
-	// clickhouse-client writes errors to stderr; keep them in probe output.
-	return res.stdout + res.stderr, res.exitCode, err
-}
-
-func (r *dockerRuntime) Logs(ctx context.Context, id string) (string, error) {
-	out, err := runOK(ctx, "docker", "logs", id)
-	return out, err
-}
-
-func (r *dockerRuntime) Stop(ctx context.Context, id string) error {
-	_, err := runOK(ctx, "docker", "stop", id)
-	return err
-}
-
-func (r *dockerRuntime) Rm(ctx context.Context, id string, force bool) error {
-	present, err := resourceInList(ctx, r.ContainerList, id)
-	if err != nil {
-		return err
-	}
-	if !present {
-		return nil // already gone — idempotent
-	}
-	args := []string{"rm"}
-	if force {
-		args = append(args, "-f")
-	}
-	args = append(args, id)
-	_, err = runOK(ctx, "docker", args...)
-	return err
 }
 
 func (r *dockerRuntime) InspectIP(ctx context.Context, id, network string) (string, error) {

@@ -35,8 +35,6 @@ type Runtime interface {
 
 	Logs(ctx context.Context, containerID string) (string, error)
 
-	Stop(ctx context.Context, containerID string) error
-
 	Rm(ctx context.Context, containerID string, force bool) error
 
 	// ContainerList returns all containers, running or not.
@@ -98,9 +96,9 @@ func selectRuntime(flag string) (Runtime, error) {
 	}
 	switch name {
 	case "container":
-		return &containerRuntime{}, nil
+		return newContainerRuntime(), nil
 	case "docker":
-		return &dockerRuntime{}, nil
+		return newDockerRuntime(), nil
 	default:
 		if flag != "" {
 			return nil, fmt.Errorf("unknown runtime %q (want \"container\" or \"docker\")", flag)
@@ -211,4 +209,81 @@ func indent(s string) string {
 		lines[i] = "    " + lines[i]
 	}
 	return strings.Join(lines, "\n")
+}
+
+// cliRuntime is what docker and apple/container share: the same subcommands
+// under another binary, differing only in how their listings are formatted.
+type cliRuntime struct {
+	bin             string
+	networkLsArgs   []string // prints one network name per line
+	containerLsArgs []string // prints every container, parsed by parseContainers
+	parseContainers func(out string) ([]string, error)
+}
+
+func (r *cliRuntime) Name() string { return r.bin }
+
+func (r *cliRuntime) NetworkCreate(ctx context.Context, name string) error {
+	_, err := runOK(ctx, r.bin, "network", "create", name)
+	return err
+}
+
+func (r *cliRuntime) NetworkRemove(ctx context.Context, name string) error {
+	if present, err := resourceInList(ctx, r.NetworkList, name); err != nil || !present {
+		return err // absent: already gone, idempotent
+	}
+	_, err := runOK(ctx, r.bin, "network", "rm", name)
+	return err
+}
+
+func (r *cliRuntime) NetworkList(ctx context.Context) ([]string, error) {
+	out, err := runOK(ctx, r.bin, r.networkLsArgs...)
+	if err != nil {
+		return nil, err
+	}
+	return splitNonEmpty(out), nil
+}
+
+func (r *cliRuntime) ContainerList(ctx context.Context) ([]string, error) {
+	out, err := runOK(ctx, r.bin, r.containerLsArgs...)
+	if err != nil {
+		return nil, err
+	}
+	return r.parseContainers(out)
+}
+
+func (r *cliRuntime) Run(ctx context.Context, opts RunOpts) error {
+	_, err := runOK(ctx, r.bin, buildRunArgs(opts)...)
+	return err
+}
+
+func (r *cliRuntime) Exec(ctx context.Context, id string, cmd []string) (string, int, error) {
+	res, err := run(ctx, r.bin, append([]string{"exec", id}, cmd...)...)
+	// clickhouse-client writes errors to stderr; keep them in probe output.
+	return res.stdout + res.stderr, res.exitCode, err
+}
+
+func (r *cliRuntime) Logs(ctx context.Context, id string) (string, error) {
+	return runOK(ctx, r.bin, "logs", id)
+}
+
+func (r *cliRuntime) Rm(ctx context.Context, id string, force bool) error {
+	if present, err := resourceInList(ctx, r.ContainerList, id); err != nil || !present {
+		return err // absent: already gone, idempotent
+	}
+	args := []string{"rm"}
+	if force {
+		args = append(args, "-f")
+	}
+	_, err := runOK(ctx, r.bin, append(args, id)...)
+	return err
+}
+
+func splitNonEmpty(s string) []string {
+	var out []string
+	for _, l := range strings.Split(s, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			out = append(out, l)
+		}
+	}
+	return out
 }

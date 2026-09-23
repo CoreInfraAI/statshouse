@@ -11,11 +11,30 @@ import (
 
 // containerRuntime shells out to apple/container (macOS), whose CLI version is
 // pinned because it drifts per release.
-type containerRuntime struct{}
+type containerRuntime struct{ cliRuntime }
 
 const pinnedContainerVersion = "1.2.0"
 
-func (r *containerRuntime) Name() string { return "container" }
+func newContainerRuntime() *containerRuntime {
+	return &containerRuntime{cliRuntime{
+		bin:             "container",
+		networkLsArgs:   []string{"network", "ls", "--quiet"},
+		containerLsArgs: []string{"ls", "--all", "--format", "json"},
+		parseContainers: func(out string) ([]string, error) {
+			var arr []struct {
+				ID string `json:"id"`
+			}
+			if err := json.Unmarshal([]byte(out), &arr); err != nil {
+				return nil, fmt.Errorf("parse container ls json: %w", err)
+			}
+			ids := make([]string, 0, len(arr))
+			for _, c := range arr {
+				ids = append(ids, c.ID)
+			}
+			return ids, nil
+		},
+	}}
+}
 
 func (r *containerRuntime) HasNetworkEgress() bool { return false }
 
@@ -90,88 +109,6 @@ func parseContainerVersion(s string) string {
 	return m[1]
 }
 
-func (r *containerRuntime) NetworkCreate(ctx context.Context, name string) error {
-	_, err := runOK(ctx, "container", "network", "create", name)
-	return err
-}
-
-func (r *containerRuntime) NetworkRemove(ctx context.Context, name string) error {
-	present, err := resourceInList(ctx, r.NetworkList, name)
-	if err != nil {
-		return err
-	}
-	if !present {
-		return nil // already gone — idempotent
-	}
-	_, err = runOK(ctx, "container", "network", "rm", name)
-	return err
-}
-
-func (r *containerRuntime) NetworkList(ctx context.Context) ([]string, error) {
-	out, err := runOK(ctx, "container", "network", "ls", "--quiet")
-	if err != nil {
-		return nil, err
-	}
-	return splitNonEmpty(out), nil
-}
-
-func (r *containerRuntime) ContainerList(ctx context.Context) ([]string, error) {
-	out, err := runOK(ctx, "container", "ls", "--all", "--format", "json")
-	if err != nil {
-		return nil, err
-	}
-	var arr []struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal([]byte(out), &arr); err != nil {
-		return nil, fmt.Errorf("parse container ls json: %w", err)
-	}
-	ids := make([]string, 0, len(arr))
-	for _, c := range arr {
-		ids = append(ids, c.ID)
-	}
-	return ids, nil
-}
-
-func (r *containerRuntime) Run(ctx context.Context, opts RunOpts) error {
-	_, err := runOK(ctx, "container", buildRunArgs(opts)...)
-	return err
-}
-
-func (r *containerRuntime) Exec(ctx context.Context, id string, cmd []string) (string, int, error) {
-	args := append([]string{"exec", id}, cmd...)
-	res, err := run(ctx, "container", args...)
-	// clickhouse-client writes errors to stderr; keep them in probe output.
-	return res.stdout + res.stderr, res.exitCode, err
-}
-
-func (r *containerRuntime) Logs(ctx context.Context, id string) (string, error) {
-	out, err := runOK(ctx, "container", "logs", id)
-	return out, err
-}
-
-func (r *containerRuntime) Stop(ctx context.Context, id string) error {
-	_, err := runOK(ctx, "container", "stop", id)
-	return err
-}
-
-func (r *containerRuntime) Rm(ctx context.Context, id string, force bool) error {
-	present, err := resourceInList(ctx, r.ContainerList, id)
-	if err != nil {
-		return err
-	}
-	if !present {
-		return nil // already gone — idempotent
-	}
-	args := []string{"rm"}
-	if force {
-		args = append(args, "-f")
-	}
-	args = append(args, id)
-	_, err = runOK(ctx, "container", args...)
-	return err
-}
-
 func (r *containerRuntime) InspectIP(ctx context.Context, id, network string) (string, error) {
 	out, err := runOK(ctx, "container", "inspect", id)
 	if err != nil {
@@ -197,17 +134,6 @@ func (r *containerRuntime) InspectIP(ctx context.Context, id, network string) (s
 		}
 	}
 	return "", fmt.Errorf("no IPv4 for container %q on network %q", id, network)
-}
-
-func splitNonEmpty(s string) []string {
-	var out []string
-	for _, l := range strings.Split(s, "\n") {
-		l = strings.TrimSpace(l)
-		if l != "" {
-			out = append(out, l)
-		}
-	}
-	return out
 }
 
 func stripCIDR(s string) string {
