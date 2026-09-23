@@ -246,8 +246,13 @@ func ValidateConfigAggregator(c *ConfigAggregator) error {
 		if c.LocalShard < 1 {
 			return fmt.Errorf("--local-shard (%d) must be >= 1 when --storage-backend=duck: there is no ClickHouse cluster to detect the shard from", c.LocalShard)
 		}
-		if c.DuckRetention1s < 0 || c.DuckRetention1m < 0 || c.DuckRetention1h < 0 {
-			return fmt.Errorf("--duck-retention-* must be >= 0 (0 keeps the tier forever)")
+		// The API reads a tier for ranges up to a fixed age (the ClickHouse TTLs), so
+		// a shorter retention would leave holes where coarser data still exists.
+		if c.DuckRetention1s < 0 || c.DuckRetention1s > 0 && c.DuckRetention1s < duckstore.DefaultRetention1s ||
+			c.DuckRetention1m < 0 || c.DuckRetention1m > 0 && c.DuckRetention1m < duckstore.DefaultRetention1m ||
+			c.DuckRetention1h < 0 {
+			return fmt.Errorf("--duck-retention-1s must be 0 or at least %s, --duck-retention-1m 0 or at least %s, --duck-retention-1h at least 0 (0 keeps the tier forever)",
+				duckstore.DefaultRetention1s, duckstore.DefaultRetention1m)
 		}
 	}
 	if c.InsertHistoricWhen < 1 {

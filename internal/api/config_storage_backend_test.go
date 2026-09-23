@@ -34,4 +34,7 @@ func TestConfigStorageBackend(t *testing.T) {
 	cfg, err = parse("--storage-backend=duck", "--duck-shard-addrs=agg1:13336,agg2:13336")
 	require.NoError(t, err)
 	require.Equal(t, []string{"agg1:13336", "agg2:13336"}, cfg.DuckShardAddrs)
+
+	_, err = parse("--storage-backend=duck", "--duck-shard-addrs=agg1:13336,agg1:13336")
+	require.ErrorContains(t, err, "twice")
 }

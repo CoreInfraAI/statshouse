@@ -38,8 +38,11 @@ statshouse-api --storage-backend=duck --duck-shard-addrs=agg1.example.com:13336
 
 Under duck there is no ClickHouse cluster to detect the shard number from, so
 the aggregator takes it from `--local-shard`. `--duck-shard-addrs` lists the
-aggregators' regular RPC addresses (`--agg-addr`), one per shard in shard
-order; `--clickhouse-v2-addrs` is not needed. The queries travel on the
+regular RPC address (`--agg-addr`) of **every aggregator that runs a store** —
+all replicas of all shards, each once: agents spread a shard's seconds over its
+replicas (and fail over between them), so each replica's store holds a part of
+the shard's data. `--clickhouse-v2-addrs` is not needed. There is no
+redundancy: a query fails while any listed aggregator is unavailable. The queries travel on the
 aggregators' RPC port, so the API must present the aggregators' crypto key:
 pass the key file with `--rpc-crypto-path` (the aggregators read theirs with
 `--aes-pwd-file`).
@@ -53,11 +56,12 @@ tier views — in a read-only transaction, with file access and settings
 changes disabled. A query can still cost CPU and memory up to the limits
 below.
 
-Every query reads every shard, and the API merges rows of one series that
-several shards hold, as a ClickHouse Distributed table would. One difference
-remains with several shards: a tag-values list is cut to its top N on each
-shard before the merge, so a value that ranks just below N everywhere can be
-missing from the merged list.
+Every query reads every listed store, and the API merges rows of one series
+that several stores hold, as a ClickHouse Distributed table would. One
+difference remains with several stores: a tag-values list is cut to its top N
+on each store before the merge, so a value that ranks just below N everywhere
+can be missing from the merged list, and a value's count only includes the
+stores where it made the cut.
 
 ## The store
 
@@ -85,7 +89,9 @@ queries, inserts and compaction from blocking each other.
 
 ## Retention and disk
 
-Defaults mirror ClickHouse's TTLs; `0` keeps a tier forever:
+Defaults mirror ClickHouse's TTLs; `0` keeps a tier forever. The API reads
+the 1s tier for ranges up to 52 hours old and the 1m tier up to 33 days, so the
+aggregator refuses a shorter nonzero retention for those two tiers:
 
 | Flag | Default | Covers |
 | --- | --- | --- |
@@ -93,11 +99,12 @@ Defaults mirror ClickHouse's TTLs; `0` keeps a tier forever:
 | `--duck-retention-1m` | 33 days | minute-resolution data |
 | `--duck-retention-1h` | unbounded | hour-resolution data |
 
-Retention deletes expired rows once a minute. DuckDB reuses the freed blocks
-rather than shrinking the file, so the file grows to the retention-bounded
-steady state and stays there. There is no disk-cap flag: disk is bounded
-upstream by the aggregator's insert (sampling) budget, the same lever as under
-ClickHouse. Size a node by watching `__duck_store_size` on a pilot.
+Retention deletes expired rows once a minute; DuckDB reuses the freed blocks
+rather than shrinking the file. With the default unbounded 1h tier the file
+never stops growing: each hour adds its collapsed rows for good, as the
+ClickHouse 1h table does. Set `--duck-retention-1h` (say `8760h`, a year) to
+bound disk. The insert (sampling) budget bounds how fast the file grows, the
+same lever as under ClickHouse; size a node by watching `__duck_store_size`.
 
 ## Resources
 
@@ -114,9 +121,9 @@ Defaults target the smallest viable node, not the available envelope:
 The file carries a schema-version stamp. A file stamped with another version
 is never read and never upgraded in place: on start the aggregator renames it
 to `statshouse.duckdb.v<version>-<unix time>`, logs that, and starts with an
-empty store. Because retention is bounded, an upgrade that changes the schema
-costs at most one retention window of history. Delete the renamed file to
-reclaim its disk.
+empty store, so an upgrade that changes the schema takes all stored history
+out of queries (with a finite 1h retention, at most that much). Delete the
+renamed file to reclaim its disk.
 
 Backup and restore are not supported. To start clean, stop the aggregator,
 remove the store directory and start it again.

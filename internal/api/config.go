@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -50,6 +51,11 @@ type Config struct {
 func (argv *Config) ValidateConfig() error {
 	if argv.StorageBackend == duckstore.BackendDuck && len(argv.DuckShardAddrs) == 0 {
 		return fmt.Errorf("--duck-shard-addrs must be set when --storage-backend=duck")
+	}
+	for i, addr := range argv.DuckShardAddrs {
+		if slices.Contains(argv.DuckShardAddrs[:i], addr) { // a store read twice would count its rows twice
+			return fmt.Errorf("--duck-shard-addrs lists %s twice", addr)
+		}
 	}
 	if argv.UserLimitsStr != "" {
 		var userLimits []chutil.ConnLimits

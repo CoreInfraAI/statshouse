@@ -32,9 +32,10 @@ func TestValidateConfigAggregatorStorageBackend(t *testing.T) {
 	require.NoError(t, ValidateConfigAggregator(&c))
 
 	for flag, set := range map[string]func(*ConfigAggregator){
-		"--migration":       func(c *ConfigAggregator) { c.RemoteInitial.MigrationTimeRange = "1-2" },
-		"--local-shard":     func(c *ConfigAggregator) { c.LocalShard = 0 },
-		"--duck-retention-": func(c *ConfigAggregator) { c.DuckRetention1m = -time.Second },
+		"--migration":         func(c *ConfigAggregator) { c.RemoteInitial.MigrationTimeRange = "1-2" },
+		"--local-shard":       func(c *ConfigAggregator) { c.LocalShard = 0 },
+		"--duck-retention-":   func(c *ConfigAggregator) { c.DuckRetention1m = -time.Second },
+		"--duck-retention-1s": func(c *ConfigAggregator) { c.DuckRetention1s = time.Hour },
 	} {
 		bad := c
 		set(&bad)

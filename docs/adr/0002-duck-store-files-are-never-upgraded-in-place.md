@@ -4,9 +4,10 @@ Embedding DuckDB makes the aggregator own an on-disk format. The store file carr
 schema version; a file stamped with another version is never read and never migrated: the aggregator
 moves it aside and starts with an empty store. There is no in-place rewrite and no compatibility shim.
 
-This is only affordable because retention is bounded: the worst case of an upgrade is that queries
-lose at most one retention window of history while fresh data accumulates, rather than a migration
-that must be written, tested and supported for every schema change.
+The price is that a schema change takes the stored history out of queries — all of it with the
+default unbounded 1h retention — while fresh data accumulates. We accept it for an optional backend
+aimed at small installations rather than write, test and support a migration for every schema
+change; operators who need a bound on the loss set a finite 1h retention.
 
 ## Consequences
 
