@@ -3206,7 +3206,7 @@ func loadPoint(ctx context.Context, h *requestHandler, pq *queryBuilder, lod dat
 			for i := 0; i < block.Rows; i++ {
 				row := query.rowAtPoint(i)
 				ret = append(ret, row)
-				if h.shardMerge() {
+				if h.duck != nil {
 					times = append(times, query.time[i])
 				}
 			}
@@ -3218,7 +3218,7 @@ func loadPoint(ctx context.Context, h *requestHandler, pq *queryBuilder, lod dat
 		return nil, err
 	}
 
-	if h.shardMerge() {
+	if h.duck != nil { // the SQL has no ORDER BY: order by time even for one store
 		ret = mergeShardPoints(ret, times)
 	}
 	if rows == maxSeriesRows || truncated {

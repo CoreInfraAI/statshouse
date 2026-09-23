@@ -351,17 +351,28 @@ func readNative(ctx context.Context, conn *sql.Conn, query string) (rows int, co
 			return 0, nil, err
 		}
 		for i, v := range vals {
-			n := len(cols[i])
+			if size += nativeSize(v); size > maxResultBytes { // checked before copying the value
+				return 0, nil, fmt.Errorf("duck-store: the result exceeds %d bytes after %d rows, narrow the query", maxResultBytes, rows)
+			}
 			if cols[i], err = appendNative(cols[i], v); err != nil {
 				return 0, nil, fmt.Errorf("duck-store: column %s: %w", types[i].Name(), err)
-			}
-			if size += len(cols[i]) - n; size > maxResultBytes {
-				return 0, nil, fmt.Errorf("duck-store: the result exceeds %d bytes after %d rows, narrow the query", maxResultBytes, rows)
 			}
 		}
 		rows++
 	}
 	return rows, cols, r.Err()
+}
+
+// nativeSize is how many bytes appendNative adds for v.
+func nativeSize(v any) int {
+	switch v := v.(type) {
+	case string:
+		return binary.MaxVarintLen64 + len(v)
+	case []byte:
+		return len(v)
+	default:
+		return 8
+	}
 }
 
 // appendNative appends one value in ClickHouse Native encoding; the SQL's
