@@ -40,14 +40,6 @@ const (
 	// Initial buffer size degree
 	uniquesHashSetInitialSizeDegree = 4
 
-	// The highest skip degree a set can reach. shrinkIfNeed raises the degree
-	// to d only while the set holds over uniquesHashMaxSize items, and at
-	// degree e every stored hash is a distinct nonzero uint32 with the low e
-	// bits zero — at most 2^(32-e)-1 of those exist, plus the zero item, so at
-	// degree 16 the set tops out at exactly uniquesHashMaxSize items and the
-	// raise loop can never push past it.
-	uniquesHashMaxSkipDegree = 16
-
 	// Golang-specific optimization. If buffer is larger, we free it on Reset, if smaller - reuse it
 	maxReuseBufferCap = 1024 / 4
 )
@@ -310,10 +302,7 @@ func (ch *ChUnique) Merge(rhs ChUnique) {
 		ch.shrinkIfNeed()
 	}
 	for i := 0; i < rhs.bufSize(); i++ {
-		// Screen with the target's filter, not the source's: ch.skipDegree can be
-		// higher than rhs.skipDegree (already, or raised by shrinkIfNeed mid-loop),
-		// and Size() extrapolates itemsCount by 1 << ch.skipDegree, so admitting an
-		// item rhs.good but !ch.good inflates the estimate.
+		// screen with the target's filter: ch.skipDegree may exceed rhs.skipDegree
 		if rhs.buf[i] != 0 && ch.good(rhs.buf[i]) {
 			ch.insertImpl(rhs.buf[i])
 			ch.shrinkIfNeed()
@@ -354,16 +343,23 @@ func (ch *ChUnique) MarshallAppendEstimatedSize() int {
 }
 
 func (ch *ChUnique) UmMarshall(r *bytes.Buffer) error {
-	skipDegree, itemsCount, err := readUniquesHeader(r)
+	ch.hasZeroItem = false
+	sd, err := r.ReadByte()
 	if err != nil {
 		return err
 	}
-	ch.hasZeroItem = false
-	ch.skipDegree = uint32(skipDegree)
-	ch.itemsCount = int32(itemsCount)
+	ch.skipDegree = uint32(sd)
+	ic, err := binary.ReadUvarint(r)
+	if err != nil {
+		return err
+	}
+	if ic > uniquesHashMaxSize {
+		return fmt.Errorf("ChUnique has too many (%d) items", ic)
+	}
+	ch.itemsCount = int32(ic)
 	ch.sizeDegree = uniquesHashSetInitialSizeDegree
-	if itemsCount > 1 {
-		ch.sizeDegree = uint32(math.Log2(float64(itemsCount)) + 2)
+	if ic > 1 {
+		ch.sizeDegree = uint32(math.Log2(float64(ic)) + 2)
 		if ch.sizeDegree < uniquesHashSetInitialSizeDegree {
 			ch.sizeDegree = uniquesHashSetInitialSizeDegree
 		}
@@ -380,7 +376,7 @@ func (ch *ChUnique) UmMarshall(r *bytes.Buffer) error {
 	}
 
 	var tmp [4]byte
-	for i := 0; i < int(itemsCount); i++ {
+	for i := 0; i < int(ic); i++ {
 		if _, err = io.ReadFull(r, tmp[:]); err != nil {
 			return err
 		}
@@ -394,174 +390,35 @@ func (ch *ChUnique) UmMarshall(r *bytes.Buffer) error {
 	return nil
 }
 
-// checkUniquesPayload verifies the receiver buffer still holds the full item
-// payload before a decode starts mutating state. bytes.Buffer.Read returns
-// (n < 4, nil) for a 1-3 byte tail, so without this check a blob truncated
-// mid-payload would either mis-decode its last item from stale bytes with no
-// error at all, or fail half-way through — after rehash()/resize() already
-// thinned the accumulator whose decode error the caller ignores.
-func checkUniquesPayload(r *bytes.Buffer, itemsCount uint64) error {
-	if r.Len() < 4*int(itemsCount) {
-		return fmt.Errorf("ChUnique payload has %d bytes for %d items, want %d", r.Len(), itemsCount, 4*itemsCount)
-	}
-	return nil
-}
-
-// readUniquesHeader reads one state blob's header and validates the whole blob
-// — header and item payload — before the caller's decode starts mutating the
-// receiver, so a rejected blob leaves the accumulator exactly as it was. The
-// buffer is left positioned at the first item byte.
-func readUniquesHeader(r *bytes.Buffer) (skipDegree byte, itemsCount uint64, err error) {
-	skipDegree, err = r.ReadByte()
-	if err != nil {
-		return 0, 0, err
-	}
-	if err := checkUniquesSkipDegree(skipDegree); err != nil {
-		return 0, 0, err
-	}
-	itemsCount, err = binary.ReadUvarint(r)
-	if err != nil {
-		return 0, 0, err
-	}
-	if itemsCount > uniquesHashMaxSize {
-		return 0, 0, fmt.Errorf("ChUnique has too many (%d) items", itemsCount)
-	}
-	// A state at the maximum skip degree is never empty: shrinkIfNeed raises
-	// the degree a step only while the set holds over uniquesHashMaxSize
-	// items, and at degree 15 only the 2^16 distinct odd multiples of 2^15
-	// fail degree 16, so a set crossing to 16 keeps at least one item (the
-	// zero item itself survives every raise). A {max, 0} blob is corrupt or
-	// hostile, not a state this codec produces: merging it would raise a
-	// lower-degree target to the maximum and rehash away all but one in 2^16
-	// of its hashes, wiping the accumulator with a success return.
-	if skipDegree == uniquesHashMaxSkipDegree && itemsCount == 0 {
-		return 0, 0, fmt.Errorf("ChUnique cannot be empty at skip degree %d", skipDegree)
-	}
-	if err := checkUniquesPayload(r, itemsCount); err != nil {
-		return 0, 0, err
-	}
-	if err := checkUniquesItems(r.Bytes(), uint32(skipDegree), itemsCount); err != nil {
-		return 0, 0, err
-	}
-	return skipDegree, itemsCount, nil
-}
-
-// checkUniquesItems validates the item payload of a state blob against its own
-// header: every nonzero hash must end in skipDegree zero bits — the codec and
-// ClickHouse's UniquesHashSet only ever store such hashes (insertHash screens
-// every insert and every degree raise rehashes the table) — and the payload's
-// distinct hashes, with the zero item counted once, must add up to the declared
-// count. A blob failing either check is corrupt or hostile, not a state this
-// codec produces: a plausible degree with unaligned hashes ({16, 1,
-// 0x12345678}) passes every length check, then raises the target's skipDegree
-// and rehashes — keeping only 1 in 2^16 of its items — before good() silently
-// drops every blob item, erasing the accumulator while returning success; a
-// duplicated hash ({16, 2, A, A}) does the same with alignment intact.
-// payload is the blob's item bytes (r.Bytes() of a checked payload).
-func checkUniquesItems(payload []byte, skipDegree uint32, itemsCount uint64) error {
-	// Small sets — the common ingestion case — deduplicate over a stack array,
-	// spilling into a map only past it, so a typical merge allocates nothing.
-	var small [8]uint32
-	var seen map[uint32]struct{}
-	distinct, zero := 0, false
-	for i := uint64(0); i < itemsCount; i++ {
-		x := binary.LittleEndian.Uint32(payload[i*4 : i*4+4])
-		if x == 0 {
-			zero = true
-			continue
-		}
-		if skipDegree > 0 && x&(1<<skipDegree-1) != 0 {
-			return fmt.Errorf("ChUnique item %#x does not end in %d zero bits", x, skipDegree)
-		}
-		dup := false
-		for _, v := range small {
-			if v == x {
-				dup = true
-				break
-			}
-		}
-		if !dup && seen != nil {
-			_, dup = seen[x]
-		}
-		if dup {
-			return fmt.Errorf("ChUnique item %#x appears more than once", x)
-		}
-		if len(seen) == 0 && distinct < len(small) {
-			small[distinct] = x
-		} else if seen == nil {
-			seen = make(map[uint32]struct{}, int(itemsCount)-len(small))
-			for _, v := range small {
-				seen[v] = struct{}{}
-			}
-			seen[x] = struct{}{}
-		} else {
-			seen[x] = struct{}{}
-		}
-		distinct++
-	}
-	have := distinct
-	if zero {
-		have++
-	}
-	if uint64(have) != itemsCount {
-		return fmt.Errorf("ChUnique declares %d items but its payload holds %d distinct", itemsCount, have)
-	}
-	return nil
-}
-
-// checkUniquesSkipDegree rejects a skip degree no accumulator can reach (see
-// uniquesHashMaxSkipDegree) — corrupt or hostile bytes, not a state this codec
-// or ClickHouse's UniquesHashSet produces. Adopting one anyway raises the
-// target's degree and rehashes, and good() then rejects every hash that does
-// not end in that many zero bits — every nonzero hash from degree 32 up — so
-// the merge thins or erases the accumulator yet returns success: a payload of
-// {0xff, 0x00} (degree 255, zero items) passes every length check on its way
-// to wiping the table clean.
-func checkUniquesSkipDegree(skipDegree byte) error {
-	if uint32(skipDegree) > uniquesHashMaxSkipDegree {
-		return fmt.Errorf("ChUnique has impossible skip degree %d, want at most %d", skipDegree, uniquesHashMaxSkipDegree)
-	}
-	return nil
-}
-
 func (ch *ChUnique) MergeRead(r *bytes.Buffer) error {
 	if ch.buf == nil {
 		return ch.UmMarshall(r)
 	}
 
-	// Read and validate the whole blob before touching the receiver: the
-	// ingestion caller ignores this error, so a malformed blob (truncated
-	// after the skip-degree byte, an impossible skip degree, a bogus item
-	// count, an item payload cut short, or items no encoder could have
-	// written — unaligned at the declared degree, duplicated, or fewer
-	// distinct than declared) must leave the accumulator exactly as it was —
-	// raising skipDegree and rehashing first would irreversibly thin the
-	// existing hashes on the way to that error or, for items good() then
-	// silently drops, past it.
-	skipDegree, itemsCount, err := readUniquesHeader(r)
+	sd, err := r.ReadByte()
 	if err != nil {
 		return err
 	}
-	if uint32(skipDegree) > ch.skipDegree {
-		// Raise the degree before rehashing, exactly as Merge does: rehash()
-		// filters by ch.skipDegree and Size() extrapolates itemsCount by
-		// 1 << skipDegree, so rehashing without raising it keeps the table's
-		// own filter at the old, lower degree while the loop below admits the
-		// blob's items — every one of them then counts for 2^old degrees
-		// instead of the 2^skipDegree it represents, and the merged set
-		// undercounts.
-		ch.skipDegree = uint32(skipDegree)
+	if uint32(sd) > ch.skipDegree {
+		ch.skipDegree = uint32(sd) // rehash filters by ch.skipDegree, raise it first as Merge does
 		ch.rehash()
 	}
-	if (1 << ch.sizeDegree) < itemsCount {
-		newSD := uint32(math.Log2(float64(itemsCount)) + 2)
+	ic, err := binary.ReadUvarint(r)
+	if err != nil {
+		return err
+	}
+	if ic > uniquesHashMaxSize {
+		return fmt.Errorf("ChUnique has too many (%d) items", ic)
+	}
+	if (1 << ch.sizeDegree) < ic {
+		newSD := uint32(math.Log2(float64(ic)) + 2)
 		if newSD < uniquesHashSetInitialSizeDegree {
 			newSD = uniquesHashSetInitialSizeDegree
 		}
 		ch.resize(newSD)
 	}
 	var tmp [4]byte
-	for i := 0; i < int(itemsCount); i++ {
+	for i := 0; i < int(ic); i++ {
 		if _, err = io.ReadFull(r, tmp[:]); err != nil {
 			return err
 		}
