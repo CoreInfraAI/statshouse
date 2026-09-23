@@ -18,6 +18,7 @@ space reuse) and the existing builder (every query shape) already provide, at se
 
 ## Consequences
 
-The SQL the API sends is trusted like the SQL it sends to ClickHouse: the RPC runs on the aggregator's
-crypto-keyed port and the aggregator serves only SELECT. Retention by DELETE cannot shrink the file,
+The aggregator's RPC port is shared with agents, so the SQL it receives is not trusted: it runs only
+one SELECT of the builder's shapes (validated on DuckDB's parse tree against allowlisted functions and
+tier views), read-only, with external access and configuration changes disabled. Retention by DELETE cannot shrink the file,
 only stop its growth, and a free-space eviction mode was dropped with the window files.

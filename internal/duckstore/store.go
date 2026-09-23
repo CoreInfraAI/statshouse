@@ -120,7 +120,7 @@ func Open(cfg Config) (*Store, error) {
 }
 
 func openDB(path string, cfg Config) (*sql.DB, error) {
-	dsn := fmt.Sprintf("%s?threads=1&memory_limit=%dB&max_temp_directory_size=%dB&temp_directory=%s",
+	dsn := fmt.Sprintf("%s?threads=1&memory_limit=%dB&max_temp_directory_size=%dB&temp_directory=%s&autoinstall_known_extensions=false&autoload_known_extensions=false",
 		path, cfg.MemoryLimitBytes, cfg.MemoryLimitBytes, filepath.Join(cfg.Dir, "tmp"))
 	return sql.Open("duckdb", dsn)
 }
@@ -150,7 +150,9 @@ func (s *Store) init() (err error) {
 		stmts = append(stmts, tierTableDDL(t.table))
 	}
 	stmts = append(stmts, compatSQL(s.cfg.ShardNum)...)
-	stmts = append(stmts, fmt.Sprintf("INSERT INTO duck_store_version SELECT %d WHERE NOT EXISTS (FROM duck_store_version)", SchemaVersion))
+	stmts = append(stmts, fmt.Sprintf("INSERT INTO duck_store_version SELECT %d WHERE NOT EXISTS (FROM duck_store_version)", SchemaVersion),
+		// queries arrive over RPC: no files, extensions or settings are reachable through them
+		"SET enable_external_access=false", "SET lock_configuration=true")
 	for _, stmt := range stmts {
 		if _, err := s.writer.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("duck-store: %s: %w", stmt, err)
@@ -278,7 +280,9 @@ func inTx(ctx context.Context, conn *sql.Conn, begin string, fn func() error) er
 	return err
 }
 
-// Query runs one SELECT and returns its columns in ClickHouse Native encoding.
+// Query runs one SELECT of the shapes the API's query builder renders (see
+// checkQueryAST) in a read-only transaction and returns its columns in
+// ClickHouse Native encoding.
 func (s *Store) Query(ctx context.Context, query string) (rows int, cols [][]byte, err error) {
 	start := time.Now()
 	select {
@@ -291,10 +295,30 @@ func (s *Store) Query(ctx context.Context, query string) (rows int, cols [][]byt
 		<-s.sema
 		s.record(format.BuiltinMetricMetaDuckQueryTime, time.Since(start).Seconds(), statusTag(err))
 	}()
-	if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "SELECT") {
-		return 0, nil, fmt.Errorf("duck-store: only SELECT is served")
+	if len(query) > maxQueryLen {
+		return 0, nil, fmt.Errorf("duck-store: query is %d bytes, at most %d are served", len(query), maxQueryLen)
 	}
-	r, err := s.db.QueryContext(ctx, query)
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer conn.Close()
+	var ast string
+	if err := conn.QueryRowContext(ctx, "SELECT CAST(json_serialize_sql(?::VARCHAR) AS VARCHAR)", query).Scan(&ast); err != nil {
+		return 0, nil, err
+	}
+	if err := checkQueryAST(ast); err != nil {
+		return 0, nil, err
+	}
+	err = inTx(ctx, conn, "BEGIN TRANSACTION READ ONLY", func() (err error) {
+		rows, cols, err = readNative(ctx, conn, query)
+		return err
+	})
+	return rows, cols, err
+}
+
+func readNative(ctx context.Context, conn *sql.Conn, query string) (rows int, cols [][]byte, err error) {
+	r, err := conn.QueryContext(ctx, query)
 	if err != nil {
 		return 0, nil, err
 	}

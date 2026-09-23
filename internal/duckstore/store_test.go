@@ -14,6 +14,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -174,4 +175,37 @@ func TestStoreInsertRecoversFromAbandonedCommit(t *testing.T) {
 	require.Error(t, s.Insert(context.Background(), testBody(sampleRow(5, now, 1))))
 	require.NoError(t, s.Insert(context.Background(), testBody(sampleRow(5, now, 1))))
 	require.Equal(t, 2, s.countRows(t, "rows_1s"))
+}
+
+// Queries arrive over RPC, so only the shapes the API's builder renders run,
+// read-only, with no file or setting reachable.
+func TestStoreQueryRefusesAnythingButBuilderSelects(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir, Config{})
+	secret := filepath.Join(dir, "secret.txt")
+	require.NoError(t, os.WriteFile(secret, []byte("s3cret"), 0o600))
+	for _, q := range []string{
+		"SELECT 1; DROP TABLE rows_1s; SELECT 1::INTEGER",
+		"SELECT 1::INTEGER; COMMIT; DELETE FROM rows_1s",
+		"DELETE FROM rows_1s",
+		"SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT 1'))",
+		"SELECT content FROM read_text('" + secret + "')",
+		"SELECT * FROM query('SELECT 1')",
+		"SELECT count(*) FROM rows_1s",
+		"SELECT metric FROM statshouse_v6_1s_dist WHERE metric IN (SELECT 1)",
+		"SELECT metric FROM statshouse_v6_1s_dist UNION ALL SELECT metric FROM statshouse_v6_1m_dist",
+		"WITH x AS (SELECT 1) SELECT * FROM x",
+		"SELECT current_setting('memory_limit')",
+		"SELECT metric FROM main.statshouse_v6_1s_dist",
+	} {
+		_, _, err := s.Query(context.Background(), q)
+		require.Error(t, err, q)
+	}
+	var n int
+	require.NoError(t, s.db.QueryRow("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'rows_1s'").Scan(&n))
+	require.Equal(t, 1, n)
+	_, err := s.db.Exec("SET memory_limit='1GB'")
+	require.Error(t, err, "the configuration is locked")
+	_, err = s.db.Exec("SELECT * FROM read_text('" + secret + "')")
+	require.Error(t, err, "external access is disabled")
 }

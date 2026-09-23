@@ -44,6 +44,15 @@ aggregators' RPC port, so the API must present the aggregators' crypto key:
 pass the key file with `--rpc-crypto-path` (the aggregators read theirs with
 `--aes-pwd-file`).
 
+That port trusts what every aggregator RPC trusts: holders of the key, and
+keyless peers on the same host or in a trusted subnet. Anyone it trusts can
+read metric data from the store and nothing else: an aggregator runs only a
+single SELECT of the shapes the API's query builder renders — checked against
+DuckDB's own parse of the query, with an allowlist of functions and of the
+tier views — in a read-only transaction, with file access and settings
+changes disabled. A query can still cost CPU and memory up to the limits
+below.
+
 Every query reads every shard, and the API merges rows of one series that
 several shards hold, as a ClickHouse Distributed table would. One difference
 remains with several shards: a tag-values list is cut to its top N on each
