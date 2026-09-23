@@ -29,6 +29,7 @@ type ArgMaxStringFloat32 struct {
 }
 
 func (arg *ArgMinMaxStringFloat32) ReadFrom(r io.ByteReader, buf []byte) ([]byte, error) {
+	*arg = ArgMinMaxStringFloat32{} // column decoders reuse elements; an empty state sets no field
 	buf = slices.Grow(buf, 6)[:6]
 	// read string
 	len, err := readUint32LE(r)
@@ -87,6 +88,9 @@ func (arg *ArgMinMaxStringFloat32) ReadFrom(r io.ByteReader, buf []byte) ([]byte
 }
 
 func (arg *ArgMinStringFloat32) Merge(rhs ArgMinStringFloat32) {
+	if rhs.Empty() {
+		return
+	}
 	if arg.Empty() {
 		*arg = rhs
 	} else if rhs.Val < arg.Val {
@@ -95,6 +99,9 @@ func (arg *ArgMinStringFloat32) Merge(rhs ArgMinStringFloat32) {
 }
 
 func (arg *ArgMaxStringFloat32) Merge(rhs ArgMaxStringFloat32) {
+	if rhs.Empty() {
+		return
+	}
 	if arg.Empty() {
 		*arg = rhs
 	} else if arg.Val < rhs.Val {
