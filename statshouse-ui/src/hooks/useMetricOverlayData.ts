@@ -42,7 +42,7 @@ export function useMetricOverlayData() {
             res[plot.id] = d[plot.id] ?? getEmptyPlotData();
             const data = queryData.data[plot.id]?.data;
             if (data) {
-              res[plot.id] = produce(res[plot.id], normalizePlotData(data, plot, timeRange, timeShifts));
+              res[plot.id] = produce(res[plot.id], normalizePlotData(data, plot, timeShifts));
             }
             return res;
           },
@@ -50,6 +50,6 @@ export function useMetricOverlayData() {
         )
       );
     }
-  }, [plotEvents, plots, queryData.data, timeRange, timeShifts]);
+  }, [plotEvents, plots, queryData.data, timeShifts]);
   return useMemo(() => ({ data, isLoading: queryData.isLoading }), [data, queryData.isLoading]);
 }

@@ -7,11 +7,20 @@
 import { Queue } from '@/common/Queue';
 import { createStore, StoreSlice } from '../createStore';
 import { PlotKey } from '@/url2';
-import { canvasToImageData } from '@/common/canvasToImage';
+import { uPlotToImageData } from '@/common/canvasToImage';
 import { skipTimeout } from '@/common/helpers';
 import { usePlotVisibilityStore } from '@/store2/plotVisibilityStore';
 
 const queuePreview = new Queue();
+
+// live mode updates every plot every few seconds, previews don't need to follow each update
+const previewMinInterval = 5000;
+const previewThrottle: Partial<Record<PlotKey, { last: number; timer?: ReturnType<typeof setTimeout> }>> = {};
+
+function clearPreviewThrottle(plotKey: PlotKey) {
+  clearTimeout(previewThrottle[plotKey]?.timer);
+  delete previewThrottle[plotKey];
+}
 
 export type PlotPreviewStore = {
   plotPreviewUrlList: Partial<Record<PlotKey, string>>;
@@ -25,6 +34,24 @@ export const plotPreviewStore: StoreSlice<PlotPreviewStore, PlotPreviewStore> = 
 export const usePlotPreviewStore = createStore<PlotPreviewStore>(plotPreviewStore);
 
 export async function createPlotPreview(plotKey: PlotKey, u: uPlot, width: number = 300) {
+  const throttle = (previewThrottle[plotKey] ??= { last: 0 });
+  clearTimeout(throttle.timer);
+  throttle.timer = undefined;
+  const wait = throttle.last + previewMinInterval - Date.now();
+  if (wait > 0 && usePlotPreviewStore.getState().plotPreviewUrlList[plotKey]) {
+    throttle.timer = setTimeout(() => {
+      throttle.timer = undefined;
+      if (u.root.isConnected) {
+        createPlotPreview(plotKey, u, width);
+      }
+    }, wait);
+    return;
+  }
+  throttle.last = Date.now();
+  await renderPlotPreview(plotKey, u, width);
+}
+
+async function renderPlotPreview(plotKey: PlotKey, u: uPlot, width: number) {
   await skipTimeout();
   if (
     !usePlotVisibilityStore.getState().plotPreviewList[plotKey] &&
@@ -38,24 +65,15 @@ export async function createPlotPreview(plotKey: PlotKey, u: uPlot, width: numbe
     state.plotPreviewAbortController[plotKey] = controller;
   });
   try {
-    const canvas = u.ctx.canvas;
-    const canvasLeft = u.bbox.left;
-    const canvasTop = u.bbox.top;
-    const canvasWidth = u.bbox.width;
-    const canvasHeight = u.bbox.height;
     const url = await queuePreview.add(
-      () =>
-        canvasToImageData(
-          canvas,
-          canvasLeft,
-          canvasTop,
-          canvasWidth,
-          canvasHeight,
-          devicePixelRatio ? devicePixelRatio * width : width
-        ),
+      () => uPlotToImageData(u, devicePixelRatio ? devicePixelRatio * width : width),
       controller.signal
     );
-    setPlotPreview(plotKey, url);
+    if (url) {
+      setPlotPreview(plotKey, url);
+    } else if (previewThrottle[plotKey]) {
+      previewThrottle[plotKey].last = 0;
+    }
   } catch (_) {
     // abort task
   }
@@ -74,6 +92,7 @@ export function setPlotPreview(plotKey: PlotKey, url: string) {
 }
 
 export function clearAllPlotPreview() {
+  (Object.keys(previewThrottle) as PlotKey[]).forEach(clearPreviewThrottle);
   usePlotPreviewStore.setState((state) => {
     Object.values(state.plotPreviewUrlList).forEach((url) => {
       if (url) {
@@ -86,6 +105,7 @@ export function clearAllPlotPreview() {
 }
 
 export function clearPlotPreview(plotKey: PlotKey) {
+  clearPreviewThrottle(plotKey);
   usePlotPreviewStore.setState((state) => {
     const url = state.plotPreviewUrlList[plotKey];
     if (url) {

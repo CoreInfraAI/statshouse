@@ -15,6 +15,9 @@ import { StatsHouseStore, useStatsHouse, useStatsHouseShallow } from '@/store2';
 import { emptyFunction } from '@/common/helpers';
 import { queryStart } from '@/store2/plotQueryStore';
 import { emptyPlotData } from '@/store2/plotDataStore/getEmptyPlotData';
+import { ThemeStore, useThemeStore } from '@/store2/themeStore';
+
+const selectorDark = ({ dark }: ThemeStore) => dark;
 
 const selectorStore = ({ params: { timeRange, timeShifts, variables } }: StatsHouseStore) => ({
   timeRange,
@@ -35,6 +38,9 @@ export function useMetricData(
   const response = queryData.data?.data;
   const error = queryData.error;
   const isLoading = queryData.isLoading || queryData.isRefetching;
+  // subscribe to the boolean only, not the whole heal history, and to the theme used for the total line color
+  const healsStatus = useStatsHouse(useCallback(({ plotHeals }) => plotHeals[plot.id]?.status, [plot.id]));
+  const dark = useThemeStore(selectorDark);
   useEffect(() => {
     let prepareEnd: () => void = emptyFunction;
     if (isLoading) {
@@ -56,9 +62,8 @@ export function useMetricData(
         });
       }
     } else if (response) {
-      const healsStatus = useStatsHouse.getState().plotHeals[plot.id]?.status;
       setPlotDataProduce((d) => {
-        const next = produce(d, normalizePlotData(response, plot, timeRange, timeShifts));
+        const next = produce(d, normalizePlotData(response, plot, timeShifts));
         next.lastHeals = true;
         if (healsStatus) {
           next.error = '';
@@ -66,7 +71,8 @@ export function useMetricData(
         return next;
       });
     }
-  }, [error, plot, response, setPlotDataProduce, timeRange, timeShifts]);
+    // timeRange is not a dependency: live mode changes it every second and the response is the same
+  }, [error, plot, response, setPlotDataProduce, timeShifts, healsStatus, dark]);
 
   return useMemo(() => [plotData, setPlotDataProduce], [plotData, setPlotDataProduce]);
 }
