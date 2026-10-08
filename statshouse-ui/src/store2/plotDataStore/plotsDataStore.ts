@@ -6,7 +6,7 @@
 
 import uPlot from 'uplot';
 import type { MetricType, QueryWhat } from '@/api/enum';
-import type { PlotKey, PlotParams, TimeRange } from '@/url2';
+import type { PlotKey, PlotParams } from '@/url2';
 import type { QuerySeriesMeta } from '@/api/query';
 import { createStore } from '@/store2/createStore';
 import { ProduceUpdate } from '@/store2/helpers';
@@ -51,7 +51,6 @@ export type PlotData = {
   errorSkipCount: number;
   seriesTimeShift: number[];
   lastPlotParams?: PlotParams;
-  lastTimeRange?: TimeRange;
   lastTimeShifts?: number[];
   lastQuerySeriesMeta?: QuerySeriesMeta[];
   loadBadges?: boolean;

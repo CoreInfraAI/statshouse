@@ -189,16 +189,41 @@ function UPlotWrapperNoMemo<LV = Record<string, unknown>>({
     onSetSelect,
   ]);
 
-  const updateScales = useCallback((scales?: UPlotWrapperPropsScales) => {
-    if (scales && uRef.current) {
-      uRef.current?.batch((u: uPlot) => {
-        Object.entries(scales).forEach(([key, scale]) => {
-          u.setScale(key, { ...scale });
-        });
+  const lastScales = useRef<{ scales?: UPlotWrapperPropsScales; series?: uPlot.Series[]; bands?: uPlot.Band[] }>({});
+  const updateScales = useCallback(
+    (scales?: UPlotWrapperPropsScales, series?: uPlot.Series[], bands?: uPlot.Band[]) => {
+      const u = uRef.current;
+      if (!scales || !u) {
+        return;
+      }
+      const last = lastScales.current;
+      lastScales.current = { scales, series, bands };
+      // live mode moves the time range every second, which is far less than a pixel on wide ranges
+      if (
+        last.scales &&
+        last.series === series &&
+        last.bands === bands &&
+        Object.keys(last.scales).sort().join() === Object.keys(scales).sort().join() &&
+        Object.entries(scales).every(([key, scale]) => {
+          const current = u.scales[key];
+          if (current?.min == null || current.max == null || scale.min == null || scale.max == null) {
+            return false;
+          }
+          const pixel = key === 'x' && u.bbox.width > 0 ? (current.max - current.min) / u.bbox.width : 0;
+          return Math.abs(scale.min - current.min) <= pixel && Math.abs(scale.max - current.max) <= pixel;
+        })
+      ) {
+        return;
+      }
+      // no batch: commits coalesce into one microtask draw that runs after parent effects (yLockRef) update;
+      // redraw first, it re-applies the current x range, so setScale after it wins
+      u.redraw(true, true);
+      Object.entries(scales).forEach(([key, scale]) => {
+        u.setScale(key, { ...scale });
       });
-      uRef.current?.redraw(true, true);
-    }
-  }, []);
+    },
+    []
+  );
 
   const updateSeries = useCallback((series: uPlot.Series[]) => {
     if (uRef.current) {
@@ -374,7 +399,7 @@ function UPlotWrapperNoMemo<LV = Record<string, unknown>>({
     updateData(data);
     updateSeries(series);
     updateBands(bands);
-    updateScales(scales);
+    updateScales(scales, series, bands);
     moveLegend();
   }, [
     bands,
@@ -414,7 +439,14 @@ function UPlotWrapperNoMemo<LV = Record<string, unknown>>({
           uWrap.style.height = `${height}px`;
         }
         const timeout = setTimeout(() => {
-          uRef.current?.setSize({ width, height });
+          const u = uRef.current;
+          if (u) {
+            u.setSize({ width, height });
+            // a skipped sub-pixel scale update can grow to several pixels on a wider plot
+            Object.entries(lastScales.current.scales ?? {}).forEach(([key, scale]) => {
+              u.setScale(key, { ...scale });
+            });
+          }
         }, 100);
         return () => {
           clearTimeout(timeout);
@@ -436,7 +468,7 @@ function UPlotWrapperNoMemo<LV = Record<string, unknown>>({
   }, [bands, updateBands]);
 
   useEffect(() => {
-    updateScales(scales);
+    updateScales(scales, series, bands);
   }, [scales, updateScales, series, bands]);
 
   useEffect(() => {

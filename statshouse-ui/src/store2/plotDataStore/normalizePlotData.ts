@@ -5,7 +5,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import type { SeriesResponse } from '@/api/query';
-import { type PlotParams, promQLMetric, type TimeRange } from '@/url2';
+import { type PlotParams, promQLMetric } from '@/url2';
 import type { ProduceUpdate } from '../helpers';
 import { isQueryWhat, METRIC_TYPE, PLOT_TYPE, QUERY_WHAT, type QueryWhat, toMetricType } from '@/api/enum';
 import uPlot from 'uplot';
@@ -26,7 +26,6 @@ import { PlotType } from '@/url/queryParams';
 export function normalizePlotData(
   response: SeriesResponse,
   plot: PlotParams,
-  timeRange: TimeRange,
   timeShifts: number[]
 ): ProduceUpdate<PlotData> {
   const width = 2000;
@@ -231,7 +230,6 @@ export function normalizePlotData(
 
     plotData.promQL = response.promql;
     plotData.lastPlotParams = deepClone(plot);
-    plotData.lastTimeRange = deepClone(timeRange);
     plotData.lastTimeShifts = deepClone(timeShifts);
 
     const maxLengthValue = plotData.series.reduce(
