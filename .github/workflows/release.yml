@@ -1,0 +1,167 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, e.g. 2026.10.0 (tag v2026.10.0 is created)'
+        required: true
+      ref:
+        description: 'Branch or commit to release from'
+        required: false
+        default: master
+      draft:
+        description: 'Create the release as a draft'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.main.outputs.tag }}
+      version: ${{ steps.main.outputs.version }}
+      sha: ${{ steps.main.outputs.sha }}
+      commit_ts: ${{ steps.main.outputs.commit_ts }}
+      build_time: ${{ steps.main.outputs.build_time }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+
+      - id: main
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid version '$INPUT_VERSION', expected X.Y.Z or X.Y.Z-suffix"
+            exit 1
+          fi
+          tag="v$version"
+          git check-ref-format "refs/tags/$tag" || { echo "::error::Invalid tag name $tag"; exit 1; }
+          # --exit-code returns 2 when the tag is absent, anything else is either a match or an error
+          rc=0
+          git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::Tag $tag already exists"
+            exit 1
+          elif [ "$rc" -ne 2 ]; then
+            echo "::error::Failed to check tag $tag"
+            exit 1
+          fi
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "sha=$(git rev-parse HEAD)"
+            echo "commit_ts=$(git log --format=%ct -n 1)"
+            echo "build_time=$(date +%FT%T%z)"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    # containers pin glibc for cgo binaries (statshouse-agg, statshouse-metadata)
+    container: ${{ matrix.container }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-22.04
+            container: debian:12
+          - arch: arm64
+            os: ubuntu-24.04-arm
+            container: debian:12
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y make git ca-certificates build-essential
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+
+      - name: Build
+        env:
+          BUILD_VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD_COMMIT: ${{ needs.prepare.outputs.sha }}
+          BUILD_COMMIT_TS: ${{ needs.prepare.outputs.commit_ts }}
+          BUILD_TIME: ${{ needs.prepare.outputs.build_time }}
+          BUILD_ID: ${{ github.run_number }}
+        run: make build-sh-ui build-sh build-sh-api build-agg build-sh-metadata
+
+      - name: Package binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          bins=(statshouse statshouse-agg statshouse-api statshouse-metadata)
+          for bin in "${bins[@]}"; do
+            src="target/${bin}"
+            if [ ! -f "$src" ]; then
+              echo "Missing binary: $src" >&2
+              exit 1
+            fi
+            tar czf "${bin}-${{ needs.prepare.outputs.version }}-linux-${{ matrix.arch }}.tar.gz" -C target "$bin"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: statshouse-${{ matrix.arch }}
+          path: '*.tar.gz'
+          if-no-files-found: error
+
+  release:
+    name: Publish ${{ needs.prepare.outputs.tag }}
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- *.tar.gz > SHA256SUMS
+
+      # creates the tag on the built commit together with the release,
+      # so a failed build never leaves a dangling tag behind
+      - name: Create tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          set -euo pipefail
+          args=(--target "$SHA" --title "$TAG" --generate-notes)
+          if [ "$DRAFT" = "true" ]; then
+            args+=(--draft)
+          fi
+          if [[ "$TAG" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$TAG" "${args[@]}" dist/*
